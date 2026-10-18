@@ -47,6 +47,9 @@ For explicit resource injection use the public Agent module's
 `NewWithDependencies`; for default application preparation use `bootstrap.New`.
 See [the SDK guide](sdk/README.md) for the full embedding API.
 
+See [runtime request and recovery options](docs/runtime-options.md) for the
+dependency-backed cache key, lazy WebSocket recovery and X11 capture behavior.
+
 ## Validation
 
 ```bash

@@ -31,8 +31,16 @@ is required. A client must distinguish completed, failed and cancelled states.
 The client chooses a stable `id` for each chat request. The same session and ID
 with the same input reuses the accepted run and its stored events; it never
 enqueues another execution. Changing input under that ID returns
-`REQUEST_CONFLICT`. A persistence error returns `PERSIST_FAILED` before any
-execution is queued. A replay load error returns `RECOVERY_FAILED`.
+`REQUEST_CONFLICT`. Failed initial durable acceptance returns `PERSIST_FAILED`
+without enqueueing execution. A replay load error returns `RECOVERY_FAILED`.
+
+Execution also requires the running-state write to succeed. An event write
+failure marks the accepted run as failed, cancels active execution and suppresses
+later output. `PERSIST_FAILED` is sent directly because the unavailable store
+cannot persist that notification; it has no durable replay cursor. Storage
+failure takes precedence over cancellation in the final run state. This also
+prevents startup metadata scans from executing a run whose full history fails
+validation when loaded lazily.
 
 Reconnect uses the last event actually received, not the last event attempted
 by the server. The handler serializes replay per connection and uses bounded,

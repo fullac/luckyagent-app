@@ -48,6 +48,9 @@ type queuedRun struct {
 	data     ChatData
 	resume   bool
 	client   *Client
+	// Protected by AgentHandler.mu. Storage failures must win over cancellation
+	// caused by stopping an execution whose output could not be persisted.
+	persistErr error
 }
 
 type sessionRunner struct {
@@ -561,12 +564,21 @@ func (h *AgentHandler) startNext(sessionID string) {
 		h.done[sessionID] = make(chan struct{})
 	}
 	h.mu.Unlock()
-	_ = h.store.UpdateRun(sessionID, run.id, func(record *persistedRun) { record.State = "running" })
 	go func() {
+		defer cancel()
 		var err error
 		client := run.client
 		if client == nil {
 			client = &Client{SessionID: sessionID, Send: make(chan *Message, 1)}
+		}
+		if err = h.runPersistenceError(sessionID, run.id); err != nil {
+			h.finishRun(sessionID, run, err)
+			return
+		}
+		if err = h.store.UpdateRun(sessionID, run.id, func(record *persistedRun) { record.State = "running" }); err != nil {
+			h.failPersistence(client, sessionID, run.id, run.parentID, err)
+			h.finishRun(sessionID, run, err)
+			return
 		}
 		if run.data.Stream {
 			err = h.streamChatRun(ctx, client, run.data, run.parentID, run.id)
@@ -585,6 +597,20 @@ func (h *AgentHandler) finishRun(sessionID string, run *queuedRun, err error) {
 		return
 	}
 	wasCancelled := runner.cancelled
+	persistErr := run.persistErr
+	h.mu.Unlock()
+	state := "completed"
+	if persistErr != nil {
+		state = "error"
+	} else if wasCancelled || errors.Is(err, context.Canceled) {
+		state = "cancelled"
+	} else if err != nil {
+		state = "error"
+	}
+	if updateErr := h.store.UpdateRun(sessionID, run.id, func(record *persistedRun) { record.State = state }); updateErr != nil {
+		h.failPersistence(run.client, sessionID, run.id, run.parentID, updateErr)
+	}
+	h.mu.Lock()
 	runner.active = nil
 	runner.cancel = nil
 	runner.cancelled = false
@@ -596,18 +622,74 @@ func (h *AgentHandler) finishRun(sessionID string, run *queuedRun, err error) {
 		}
 	}
 	h.mu.Unlock()
-	state := "completed"
-	if wasCancelled || errors.Is(err, context.Canceled) {
-		state = "cancelled"
-	} else if err != nil {
-		state = "error"
-	}
-	_ = h.store.UpdateRun(sessionID, run.id, func(record *persistedRun) { record.State = state })
 	h.startNext(sessionID)
 }
 
+// runLocked finds both active and accepted queued runs. Queued status events are
+// persisted before startNext, so their write failures must also prevent execution.
+func (h *AgentHandler) runLocked(sessionID, runID string) *queuedRun {
+	if runID == "" {
+		return nil
+	}
+	if runner := h.runners[sessionID]; runner != nil {
+		if runner.active != nil && runner.active.id == runID {
+			return runner.active
+		}
+		for _, run := range runner.queue {
+			if run.id == runID {
+				return run
+			}
+		}
+	}
+	return nil
+}
+
+func (h *AgentHandler) runPersistenceError(sessionID, runID string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if run := h.runLocked(sessionID, runID); run != nil {
+		return run.persistErr
+	}
+	return nil
+}
+
+func (h *AgentHandler) failPersistence(client *Client, sessionID, runID, parentID string, err error) {
+	h.mu.Lock()
+	var cancel context.CancelFunc
+	if run := h.runLocked(sessionID, runID); run != nil {
+		if run.persistErr != nil {
+			h.mu.Unlock()
+			return
+		}
+		run.persistErr = err
+		if runner := h.runners[sessionID]; runner.active == run {
+			cancel = runner.cancel
+		}
+	}
+	sink := h.eventSink
+	h.mu.Unlock()
+	logger.Error("persist websocket run failed", "session", sessionID, "run_id", runID, "error", err)
+	if cancel != nil {
+		cancel()
+	}
+	// This notification cannot use emit: the same failing store must not hide
+	// the error or recursively try to persist it. It has no durable replay cursor.
+	msg, _ := NewMessage(TypeError, sessionID, ErrorData{Code: "PERSIST_FAILED", Message: "run persistence failed; execution stopped"})
+	msg.RunID, msg.ParentID = runID, parentID
+	msg.ID, msg.EventID = "", ""
+	if sink != nil {
+		sink(sessionID, msg)
+	} else if client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := client.SendReliable(ctx, msg); err != nil {
+			client.Close()
+		}
+	}
+}
+
 func (h *AgentHandler) emit(client *Client, sessionID, runID string, msg *Message) {
-	if msg == nil {
+	if msg == nil || h.runPersistenceError(sessionID, runID) != nil {
 		return
 	}
 	msg.SessionID = sessionID
@@ -615,7 +697,8 @@ func (h *AgentHandler) emit(client *Client, sessionID, runID string, msg *Messag
 		msg.RunID = runID
 	}
 	if err := h.store.AppendEvent(sessionID, runID, msg); err != nil {
-		logger.Error("persist websocket event failed", "session", sessionID, "error", err)
+		h.failPersistence(client, sessionID, runID, msg.ParentID, err)
+		return
 	}
 	h.mu.Lock()
 	sink := h.eventSink
@@ -642,6 +725,9 @@ func (h *AgentHandler) syncChatRun(ctx context.Context, client *Client, data Cha
 	})
 	status.ParentID = parentID
 	h.emit(client, client.SessionID, runID, status)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	sessionID := h.ensureSession(client.SessionID)
 	turn := agent.MultimodalUserTurnInput(data.Message, data.Attachments)
@@ -704,6 +790,9 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 	})
 	status.ParentID = parentID
 	h.emit(client, client.SessionID, runID, status)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	sessionID := h.ensureSession(client.SessionID)
 	turn := agent.MultimodalUserTurnInput(data.Message, data.Attachments)
@@ -792,11 +881,32 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 		sendIdle()
 	}
 
-	for evt := range streamCh {
+	for {
+		var evt agent.ChatEvent
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case next, ok := <-streamCh:
+			if !ok {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				err = errors.New("agent stream ended without a completed result")
+				sendError(err)
+				return err
+			}
+			evt = next
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		switch evt.Type {
 		case agent.ChatEventThinking:
 			if evt.TaskID != "" && runID != "" {
-				_ = h.store.UpdateRun(client.SessionID, runID, func(record *persistedRun) { record.TaskID = evt.TaskID })
+				if err := h.store.UpdateRun(client.SessionID, runID, func(record *persistedRun) { record.TaskID = evt.TaskID }); err != nil {
+					h.failPersistence(client, client.SessionID, runID, parentID, err)
+					return err
+				}
 			}
 			reasoning, ok := reasoningDataForEvent(evt.Content)
 			if !ok {
@@ -984,13 +1094,6 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 			return streamErr
 		}
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-
-	err = errors.New("agent stream ended without a completed result")
-	sendError(err)
-	return err
 }
 
 type toolAttachmentPayload struct {
