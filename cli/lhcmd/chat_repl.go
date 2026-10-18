@@ -552,6 +552,9 @@ func handleCommand(input string, a *agent.Agent, loopCfg *agent.LoopConfig, cron
 	if fn, ok := buildREPLCommandRegistry()[cmd]; ok {
 		return fn(ctx, arg)
 	}
+	if a != nil && a.HasPluginCommand(input) {
+		return false, false
+	}
 
 	fmt.Printf("未知命令: %s (输入 /help 查看帮助)\n", cmd)
 	return true, false

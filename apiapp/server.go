@@ -912,7 +912,7 @@ func (s *Server) handleChatSync(w http.ResponseWriter, r *http.Request) {
 func (s *Server) doChatSync(w http.ResponseWriter, r *http.Request, req ChatRequest, loopCfg agent.LoopConfig, ctx context.Context, start time.Time) {
 	turn := agent.MultimodalUserTurnInput(req.Message, req.Attachments)
 	// v0.56.0: 检测内置命令
-	if strings.HasPrefix(req.Message, "/") {
+	if strings.HasPrefix(req.Message, "/") && !s.agent.HasPluginCommand(req.Message) {
 		parts := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(req.Message, "/")), " ", 2)
 		cmd := strings.ToLower(strings.TrimSpace(parts[0]))
 		args := ""

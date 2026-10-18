@@ -201,7 +201,11 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *gateway.Message) error
 	if h == nil || h.adapter == nil || h.agent == nil || msg == nil {
 		return fmt.Errorf("%s: handler not initialized", h.platform())
 	}
-	if msg.IsCommand {
+	pluginCommand := false
+	if runtime, ok := h.agent.(interface{ HasPluginCommand(string) bool }); ok {
+		pluginCommand = runtime.HasPluginCommand(msg.Text)
+	}
+	if msg.IsCommand && !pluginCommand {
 		if handler, ok := h.commands[h.commandKey(msg.Command)]; ok {
 			return handler(ctx, msg)
 		}

@@ -30,6 +30,11 @@ The API reliability contracts, including request retries, stream terminal
 states, local authentication and gRPC integration, are documented in
 [API execution and recovery](docs/api-reliability.md).
 
+`lh plugin` manages declarative plugin installations without constructing an
+Agent. Enabled plugins add namespaced commands to CLI, HTTP and gateway turns;
+execution and inherited policy belong to the public Agent module. See
+[plugin application integration](docs/plugins.md).
+
 ## Embed the complete runtime
 
 ```go
