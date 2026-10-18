@@ -10,9 +10,9 @@ require (
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
-	github.com/yurika0211/lucky-agent/agent v0.0.0-20261018041334-b9ae878d8cac
+	github.com/yurika0211/lucky-agent/agent v0.0.0-20261018052756-75a7805fdc6b
 	github.com/yurika0211/luckyagent-plugins v0.1.0
-	github.com/yurika0211/luckyagent-runtime v0.0.0-20261018040609-b7b93aead632
+	github.com/yurika0211/luckyagent-runtime v0.0.0-20261018052535-7b5f72b12155
 	golang.org/x/term v0.41.0
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11
@@ -77,7 +77,7 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/yurika0211/luckyagent-api v0.2.2-0.20261018041303-09b380cc8af9
 	github.com/yurika0211/luckyagent-gateway v0.2.2
-	github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018035924-2378aea7cd81
+	github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018052536-16378ebd0e55
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
