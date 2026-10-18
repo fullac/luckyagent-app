@@ -12,6 +12,10 @@ type loopConfigRuntime interface {
 	ChatWithSessionStreamInputWithLoopConfig(context.Context, string, agent.UserTurnInput, agent.LoopConfig) (<-chan agent.ChatEvent, error)
 }
 
+type boundStreamRuntime interface {
+	ChatWithSessionStreamForSession(context.Context, *session.Session, agent.UserTurnInput, agent.LoopConfig) (<-chan agent.ChatEvent, error)
+}
+
 func (h *AgentHandler) chatLoopConfig(data ChatData) agent.LoopConfig {
 	cfg := agent.DefaultLoopConfig()
 	if runtime, ok := h.agent.(runtimeConfigProvider); ok && runtime.Config() != nil {
@@ -24,9 +28,8 @@ func (h *AgentHandler) chatLoopConfig(data ChatData) agent.LoopConfig {
 	return cfg
 }
 
-func (h *AgentHandler) syncTurn(ctx context.Context, sessionID string, turn agent.UserTurnInput, data ChatData) (string, int, error) {
+func (h *AgentHandler) syncTurn(ctx context.Context, sess *session.Session, sessionID string, turn agent.UserTurnInput, data ChatData) (string, int, error) {
 	if runtime, ok := h.agent.(loopConfigRuntime); ok {
-		sess, _ := h.agent.Sessions().Get(sessionID)
 		result, err := runtime.RunLoopWithSessionInput(ctx, sess, turn, h.chatLoopConfig(data))
 		if err != nil {
 			return "", 0, err

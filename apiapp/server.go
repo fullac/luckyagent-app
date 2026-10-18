@@ -82,7 +82,8 @@ type Server struct {
 	healthCheck *health.HealthCheck
 
 	// v0.18.0: WebSocket
-	wsHub *websocket.Hub
+	wsHub     *websocket.Hub
+	wsHandler *websocket.AgentHandler
 
 	// v0.22.0: 多 Agent 协作
 	collabRegistry  *collab.Registry
@@ -241,6 +242,7 @@ func New(a *agent.Agent, cfg ServerConfig) *Server {
 		metrics:         m,
 		healthCheck:     hc,
 		wsHub:           wsHub,
+		wsHandler:       wsHandler,
 		collabRegistry:  collabRegistry,
 		delegateManager: delegateManager,
 		workflowEngine:  workflowEngine,
@@ -640,7 +642,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.sendError(w, "message is required", http.StatusBadRequest, "")
 		return
 	}
-	if !s.validateChatSession(w, req.SessionID) {
+	sess, ok := s.resolveChatSession(w, req.SessionID)
+	if !ok {
 		return
 	}
 	if req.MaxIter < 0 || req.MaxIter > 300 {
@@ -665,10 +668,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	parentCtx := r.Context()
 
 	// SSE 流式响应
-	_, ok := w.(http.Flusher)
+	_, ok = w.(http.Flusher)
 	if !ok {
 		// 不支持 SSE，降级为同步
-		s.doChatSync(w, r, req, loopCfg, parentCtx, start)
+		s.doChatSyncForSession(w, r, req, loopCfg, parentCtx, start, sess)
 		return
 	}
 
@@ -682,10 +685,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	_ = controller.SetWriteDeadline(time.Time{})
 
 	sessionID := req.SessionID
-	if sessionID == "" {
-		if sess := s.agent.Sessions().NewWithTitle("chat-stream"); sess != nil {
-			sessionID = sess.ID
-		}
+	if sess == nil {
+		sess = s.agent.Sessions().NewWithTitle("chat-stream")
+	}
+	if sess != nil {
+		sessionID = sess.ID
 	}
 	ctx, cancel := s.registerChatCancellation(parentCtx, sessionID)
 	defer cancel()
@@ -710,7 +714,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 	turn := agent.MultimodalUserTurnInput(req.Message, req.Attachments)
-	events, err := s.agent.ChatWithSessionStreamInputWithLoopConfig(ctx, sessionID, turn, loopCfg)
+	events, err := s.agent.ChatWithSessionStreamForSession(ctx, sess, turn, loopCfg)
 	if err != nil {
 		_ = writeFrame(map[string]any{"type": "error", "error": err.Error(), "error_code": "CHAT_FAILED", "status": "failed"})
 		return
@@ -856,7 +860,8 @@ func (s *Server) handleChatSync(w http.ResponseWriter, r *http.Request) {
 		s.sendError(w, "message is required", http.StatusBadRequest, "")
 		return
 	}
-	if !s.validateChatSession(w, req.SessionID) {
+	sess, ok := s.resolveChatSession(w, req.SessionID)
+	if !ok {
 		return
 	}
 	if req.MaxIter < 0 || req.MaxIter > 300 {
@@ -880,10 +885,14 @@ func (s *Server) handleChatSync(w http.ResponseWriter, r *http.Request) {
 	loopCfg.Source = "http"
 
 	ctx := r.Context()
-	s.doChatSync(w, r, req, loopCfg, ctx, start)
+	s.doChatSyncForSession(w, r, req, loopCfg, ctx, start, sess)
 }
 
 func (s *Server) doChatSync(w http.ResponseWriter, r *http.Request, req ChatRequest, loopCfg agent.LoopConfig, ctx context.Context, start time.Time) {
+	s.doChatSyncForSession(w, r, req, loopCfg, ctx, start, nil)
+}
+
+func (s *Server) doChatSyncForSession(w http.ResponseWriter, r *http.Request, req ChatRequest, loopCfg agent.LoopConfig, ctx context.Context, start time.Time, sess *session.Session) {
 	turn := agent.MultimodalUserTurnInput(req.Message, req.Attachments)
 	// v0.56.0: 检测内置命令
 	if strings.HasPrefix(req.Message, "/") && !s.agent.HasPluginCommand(req.Message) {
@@ -971,8 +980,9 @@ func (s *Server) doChatSync(w http.ResponseWriter, r *http.Request, req ChatRequ
 
 	// v0.24.1: 如果没有提供 session_id，创建新会话
 	sessionID := req.SessionID
-	var sess *session.Session
-	if sessionID == "" {
+	if sess != nil {
+		sessionID = sess.ID
+	} else if sessionID == "" {
 		sess = s.agent.Sessions().NewWithTitle("chat")
 		if sess != nil {
 			sessionID = sess.ID
@@ -1161,7 +1171,10 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.TrimSpace(body.Title) != "" {
 			sess.SetTitle(body.Title)
-			_ = sess.Save()
+			if err := sess.Save(); err != nil {
+				s.sendError(w, "save session failed", sessionStorageStatus(err), err.Error())
+				return
+			}
 		}
 		role, _ := sess.AgentProfile()
 
@@ -1209,9 +1222,18 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		return
 	case http.MethodDelete:
 		if err := appservice.NewSessions(s.agent.Sessions(), s.agent.ForgetShortTermSession).Delete(sess.ID, ""); err != nil {
-			s.sendError(w, "delete session failed", http.StatusInternalServerError, err.Error())
+			s.sendError(w, "delete session failed", sessionStorageStatus(err), err.Error())
 			return
 		}
+		// Delete first so failed storage operations leave live tasks alone. The
+		// tombstone stops old handles writing while cancellation reaches workers.
+		// Clear queued socket turns before cancelling the Agent; otherwise a
+		// finishing active turn could start its successor during cancellation.
+		if s.wsHandler != nil {
+			s.wsHandler.CancelSession(sess.ID)
+		}
+		s.cancelChat(sess.ID)
+		s.agent.CancelSession(sess.ID)
 		s.sendJSON(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
 		return
 	case http.MethodGet:
@@ -1231,11 +1253,16 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		var err error
 		rawMessages, total, hasMore, err = sess.GetMessagesPage(limit, offset)
 		if err != nil {
-			s.sendError(w, "load session history failed", http.StatusInternalServerError, err.Error())
+			s.sendError(w, "load session history failed", sessionStorageStatus(err), err.Error())
 			return
 		}
 	} else {
-		rawMessages = sess.GetMessages()
+		var err error
+		rawMessages, err = sess.GetMessagesWithError()
+		if err != nil {
+			s.sendError(w, "load session history failed", sessionStorageStatus(err), err.Error())
+			return
+		}
 		total = len(rawMessages)
 	}
 	includeFull := false
@@ -1310,7 +1337,7 @@ func (s *Server) patchSession(w http.ResponseWriter, r *http.Request, sess *sess
 	if err := appservice.UpdateSessionMetadata(sess, appservice.SessionMetadata{
 		Title: body.Title, Pinned: body.Pinned, Project: body.Project,
 	}); err != nil {
-		s.sendError(w, "save session failed", http.StatusInternalServerError, err.Error())
+		s.sendError(w, "save session failed", sessionStorageStatus(err), err.Error())
 		return
 	}
 	pinned, project := sess.Organization()
@@ -1323,6 +1350,13 @@ func (s *Server) patchSession(w http.ResponseWriter, r *http.Request, sess *sess
 		"created_at":    sess.CreatedAt.Format(time.RFC3339),
 		"updated_at":    sess.UpdatedAt.Format(time.RFC3339),
 	})
+}
+
+func sessionStorageStatus(err error) int {
+	if errors.Is(err, session.ErrSessionDeleted) {
+		return http.StatusGone
+	}
+	return http.StatusInternalServerError
 }
 
 func (s *Server) handleSessionSubresource(w http.ResponseWriter, r *http.Request, sess *session.Session, parts []string) {

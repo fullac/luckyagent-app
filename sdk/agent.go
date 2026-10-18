@@ -207,7 +207,10 @@ func (a *Agent) GetSession(sessionID string) (*Session, error) {
 	if !ok || sess == nil {
 		return nil, fmt.Errorf("sdk: session %q not found", sessionID)
 	}
-	msgs := sess.GetMessages()
+	msgs, err := sess.GetMessagesWithError()
+	if err != nil {
+		return nil, fmt.Errorf("sdk: load session history: %w", err)
+	}
 	outMsgs := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
 		outMsgs = append(outMsgs, Message{
@@ -239,6 +242,7 @@ func (a *Agent) DeleteSession(sessionID string) error {
 	if err := appservice.NewSessions(a.inner.Sessions(), a.inner.ForgetShortTermSession).Delete(sessionID, ""); err != nil {
 		return fmt.Errorf("sdk: delete session: %w", err)
 	}
+	a.inner.CancelSession(sessionID)
 	return nil
 }
 

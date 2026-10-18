@@ -48,6 +48,9 @@ type queuedRun struct {
 	data     ChatData
 	resume   bool
 	client   *Client
+	// Bind an accepted turn to its original handle. A deleted session ID may
+	// later be reused, but queued work must not create or adopt that new session.
+	session *session.Session
 	// Protected by AgentHandler.mu. Storage failures must win over cancellation
 	// caused by stopping an execution whose output could not be persisted.
 	persistErr error
@@ -123,6 +126,9 @@ func (h *AgentHandler) Start() {
 			Attachments: persisted.Attachments,
 		}
 		run := &queuedRun{id: persisted.ID, parentID: persisted.ParentID, data: data}
+		if h.agent != nil && h.agent.Sessions() != nil {
+			run.session = h.agent.Sessions().Ensure(persisted.SessionID)
+		}
 		if persisted.TaskID != "" {
 			run.data.Message = "继续前台任务 " + persisted.TaskID
 			run.data.Attachments = nil
@@ -486,6 +492,11 @@ func (h *AgentHandler) handleChat(client *Client, msg *Message) {
 		CreatedAt:   time.Now().UTC(),
 		UpdatedAt:   time.Now().UTC(),
 	}
+	// Capture an existing handle before durable acceptance, so a concurrent
+	// deletion during the store write cannot make this turn recreate its ID.
+	if sessions := h.agent.Sessions(); sessions != nil {
+		run.session, _ = sessions.Get(client.SessionID)
+	}
 	stored, created, err := h.store.CreateRun(persisted)
 	if err != nil {
 		logger.Error("persist websocket run failed", "session", client.SessionID, "error", err)
@@ -499,6 +510,9 @@ func (h *AgentHandler) handleChat(client *Client, msg *Message) {
 	if !created {
 		h.replayAcceptedRun(client, stored)
 		return
+	}
+	if run.session == nil && h.agent.Sessions() != nil {
+		run.session = h.agent.Sessions().Ensure(client.SessionID)
 	}
 	h.mu.Lock()
 	runner := h.runners[client.SessionID]
@@ -729,12 +743,26 @@ func (h *AgentHandler) syncChatRun(ctx context.Context, client *Client, data Cha
 		return ctx.Err()
 	}
 
-	sessionID := h.ensureSession(client.SessionID)
+	sess, err := h.sessionForRun(ctx, client.SessionID, runID)
+	if err != nil {
+		if ctx.Err() == nil {
+			h.sendSessionHistoryError(client, runID, parentID, err)
+		}
+		return err
+	}
+	sessionID := client.SessionID
+	if sess != nil {
+		sessionID = sess.ID
+	}
 	turn := agent.MultimodalUserTurnInput(data.Message, data.Attachments)
-	result, iterations, err := h.syncTurn(ctx, sessionID, turn, data)
+	result, iterations, err := h.syncTurn(ctx, sess, sessionID, turn, data)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, session.ErrSessionDeleted) {
+			h.sendSessionHistoryError(client, runID, parentID, err)
+			return err
 		}
 		errMsg, _ := NewMessage(TypeError, client.SessionID, ErrorData{
 			Code:    "AGENT_ERROR",
@@ -747,12 +775,24 @@ func (h *AgentHandler) syncChatRun(ctx context.Context, client *Client, data Cha
 	var createdAt *time.Time
 	var usage *provider.TokenUsage
 	if sessions := h.agent.Sessions(); sessions != nil {
-		if sess, ok := sessions.Get(sessionID); ok {
-			messages := sess.GetMessages()
-			if len(messages) > 0 && messages[len(messages)-1].Role == "assistant" {
-				createdAt = messages[len(messages)-1].CreatedAt
-				usage = messages[len(messages)-1].Usage
-			}
+		ok := sess != nil
+		if !ok {
+			sess, ok = sessions.Get(sessionID)
+		}
+		var messages []provider.Message
+		var historyErr error
+		if !ok {
+			historyErr = fmt.Errorf("%w: %s", session.ErrSessionDeleted, sessionID)
+		} else {
+			messages, historyErr = sess.GetMessagesWithError()
+		}
+		if historyErr != nil {
+			h.sendSessionHistoryError(client, runID, parentID, historyErr)
+			return historyErr
+		}
+		if len(messages) > 0 && messages[len(messages)-1].Role == "assistant" {
+			createdAt = messages[len(messages)-1].CreatedAt
+			usage = messages[len(messages)-1].Usage
 		}
 	}
 
@@ -794,11 +834,22 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 		return ctx.Err()
 	}
 
-	sessionID := h.ensureSession(client.SessionID)
+	sess, err := h.sessionForRun(ctx, client.SessionID, runID)
+	if err != nil {
+		if ctx.Err() == nil {
+			h.sendSessionHistoryError(client, runID, parentID, err)
+		}
+		return err
+	}
+	sessionID := client.SessionID
+	if sess != nil {
+		sessionID = sess.ID
+	}
 	turn := agent.MultimodalUserTurnInput(data.Message, data.Attachments)
 	var streamCh <-chan agent.ChatEvent
-	var err error
-	if runtime, ok := h.agent.(loopConfigRuntime); ok {
+	if runtime, ok := h.agent.(boundStreamRuntime); ok && sess != nil {
+		streamCh, err = runtime.ChatWithSessionStreamForSession(ctx, sess, turn, h.chatLoopConfig(data))
+	} else if runtime, ok := h.agent.(loopConfigRuntime); ok {
 		streamCh, err = runtime.ChatWithSessionStreamInputWithLoopConfig(ctx, sessionID, turn, h.chatLoopConfig(data))
 	} else {
 		streamCh, err = h.agent.ChatWithSessionStreamInput(ctx, sessionID, turn)
@@ -806,6 +857,10 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if errors.Is(err, session.ErrSessionDeleted) {
+			h.sendSessionHistoryError(client, runID, parentID, err)
+			return err
 		}
 		errMsg, _ := NewMessage(TypeError, client.SessionID, ErrorData{
 			Code:    "AGENT_ERROR",
@@ -1063,6 +1118,12 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 			h.emit(client, client.SessionID, runID, msg)
 
 		case agent.ChatEventDone:
+			if _, err := h.sessionForRun(ctx, client.SessionID, runID); err != nil {
+				if ctx.Err() == nil {
+					h.sendSessionHistoryError(client, runID, parentID, err)
+				}
+				return err
+			}
 			emitRoundProgress(max(currentRound, 1))
 			if evt.Content != "" {
 				fullResponse.Reset()
@@ -1398,6 +1459,43 @@ func (h *AgentHandler) ensureSession(sessionID string) string {
 		return h.agent.Sessions().New().ID
 	}
 	return h.agent.Sessions().Ensure(sessionID).ID
+}
+
+func (h *AgentHandler) sessionForRun(ctx context.Context, sessionID, runID string) (*session.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	bound := h.boundRunSession(sessionID, runID)
+	if bound != nil {
+		if _, err := bound.GetMessagesWithError(1); err != nil {
+			return nil, err
+		}
+		return bound, nil
+	}
+	// Legacy direct syncChat/streamChat callers have no queued run to bind.
+	if h.agent == nil || h.agent.Sessions() == nil {
+		return nil, nil
+	}
+	return h.agent.Sessions().Ensure(sessionID), nil
+}
+
+func (h *AgentHandler) boundRunSession(sessionID, runID string) *session.Session {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if run := h.runLocked(sessionID, runID); run != nil {
+		return run.session
+	}
+	return nil
+}
+
+func (h *AgentHandler) sendSessionHistoryError(client *Client, runID, parentID string, err error) {
+	code := "SESSION_HISTORY_FAILED"
+	if errors.Is(err, session.ErrSessionDeleted) {
+		code = "SESSION_DELETED"
+	}
+	msg, _ := NewMessage(TypeError, client.SessionID, ErrorData{Code: code, Message: "load session history failed: " + err.Error()})
+	msg.ParentID = parentID
+	h.emit(client, client.SessionID, runID, msg)
 }
 
 func reasoningDataForEvent(content string) (ReasoningData, bool) {
