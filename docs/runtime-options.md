@@ -24,6 +24,11 @@ runtime, tools and API modules. The pinned dependencies provide these options:
   The context inspection bucket maps can now contain `project`; clients should
   accept this additive key. No HTTP route or session format changes are required.
 
+`POST /api/v1/context/fit` retains its existing text DTO: `role`, `content`,
+`priority` and `category`. Native `tool_calls` and `tool_call_id` are outside
+that endpoint's current request/response contract. The Agent/runtime support
+for complete tool exchanges does not add those fields to the HTTP adapter.
+
 Transport routes, event fields and configuration defaults are preserved. The
 configuration schema and request mapping live in `luckyagent-runtime`; capture
 and tool schemas live in `luckyagent-tools`; recovery storage lives in

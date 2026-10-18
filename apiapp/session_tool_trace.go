@@ -27,7 +27,11 @@ func (s *Server) handleSessionToolTrace(w http.ResponseWriter, r *http.Request, 
 		s.sendError(w, "turn must be first or omitted", http.StatusBadRequest, "")
 		return
 	}
-	messages := sess.GetMessages()
+	messages, err := sess.GetMessagesWithError()
+	if err != nil {
+		s.sendError(w, "load session history failed", sessionStorageStatus(err), err.Error())
+		return
+	}
 	if turn == "first" {
 		// Legacy compaction can remove the original turn. Do not relabel a
 		// follow-up as the delegated execution merely because it is now first.

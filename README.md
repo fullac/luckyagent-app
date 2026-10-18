@@ -29,6 +29,8 @@ configuration keys retain their ownership and compatibility contracts.
 The API reliability contracts, including request retries, stream terminal
 states, local authentication and gRPC integration, are documented in
 [API execution and recovery](docs/api-reliability.md).
+Session history errors, deletion cancellation and queued WebSocket handle
+ownership are described in [session reliability](docs/session-reliability.md).
 
 `lh plugin` manages declarative plugin installations without constructing an
 Agent. Enabled plugins add namespaced commands to CLI, HTTP and gateway turns;

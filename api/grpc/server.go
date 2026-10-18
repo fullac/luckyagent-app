@@ -103,7 +103,7 @@ func (s *Server) ChatStream(req *ChatRequest, stream LuckyAgentService_ChatStrea
 	if err != nil {
 		return err
 	}
-	events, err := s.agent.ChatWithSessionStreamInputWithLoopConfig(ctx, sess.ID, agent.TextUserTurnInput(req.Message), loopCfg)
+	events, err := s.agent.ChatWithSessionStreamForSession(ctx, sess, agent.TextUserTurnInput(req.Message), loopCfg)
 	if err != nil {
 		return chatStatusError(err)
 	}
