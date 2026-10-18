@@ -12,6 +12,22 @@ runtime, tools and API modules. The pinned dependencies provide these options:
   Configuration reload follows the existing provider rebuild path.
 - X11 capture uses a bounded native local-display fallback when ImageMagick
   fails. Input/window selection still uses xdotool; WSLg has a separate backend.
+- Long-task context uses `context.max_context_tokens` and the reply reserve
+  consistently across planning, automatic compaction and durable continuation.
+  Legacy JSON with only `max_tokens` migrates to that context limit; an explicit
+  canonical value wins. The legacy setter updates both. `limits.max_tokens`
+  continues to control generation output.
+- The Agent preserves complete tool exchanges, bounds the model's summary
+  projection, and exposes `context_history_read` for current-session evidence.
+  Durable execution derives a task-state ledger from saved operations and
+  reviews execution requests even when the first response only promises work.
+  The context inspection bucket maps can now contain `project`; clients should
+  accept this additive key. No HTTP route or session format changes are required.
+
+`POST /api/v1/context/fit` retains its existing text DTO: `role`, `content`,
+`priority` and `category`. Native `tool_calls` and `tool_call_id` are outside
+that endpoint's current request/response contract. The Agent/runtime support
+for complete tool exchanges does not add those fields to the HTTP adapter.
 
 Transport routes, event fields and configuration defaults are preserved. The
 configuration schema and request mapping live in `luckyagent-runtime`; capture
