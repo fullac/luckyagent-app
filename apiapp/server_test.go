@@ -1,0 +1,1506 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	appboot "github.com/yurika0211/luckyagent-app/bootstrap"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/yurika0211/lucky-agent/agent"
+	"github.com/yurika0211/luckyagent-runtime/config"
+	"github.com/yurika0211/luckyagent-runtime/tool"
+	"github.com/yurika0211/luckyagent-tools/collab"
+	taskstore "github.com/yurika0211/luckyagent-tools/task"
+)
+
+// createTestAgent 创建测试用 Agent（使用临时目录，不污染生产数据）
+func createTestAgent(t *testing.T) *agent.Agent {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		var req struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	tmpDir := t.TempDir()
+	mgr, err := config.NewManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("create config manager: %v", err)
+	}
+	if err := mgr.Set("provider", "openai"); err != nil {
+		t.Fatalf("set provider: %v", err)
+	}
+	if err := mgr.Set("api_key", "sk-test"); err != nil {
+		t.Fatalf("set api_key: %v", err)
+	}
+	if err := mgr.Set("api_base", upstream.URL); err != nil {
+		t.Fatalf("set api_base: %v", err)
+	}
+	if err := mgr.Set("model", "gpt-test"); err != nil {
+		t.Fatalf("set model: %v", err)
+	}
+	a, err := appboot.New(mgr)
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	return a
+}
+
+func TestNew(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := DefaultServerConfig()
+	s := New(a, cfg)
+
+	if s == nil {
+		t.Fatal("server should not be nil")
+	}
+	if s.config.Addr != "127.0.0.1:9090" {
+		t.Errorf("expected addr 127.0.0.1:9090, got %s", s.config.Addr)
+	}
+	if s.config.RateLimit != 60 {
+		t.Errorf("expected rate limit 60, got %d", s.config.RateLimit)
+	}
+	if s.rateLimiter == nil {
+		t.Error("rate limiter should not be nil")
+	}
+	if a.TaskStore() == nil {
+		t.Fatal("agent task store should be initialized")
+	}
+	if err := s.collabRegistry.Register(&collab.AgentProfile{ID: "agent-test", Name: "Agent Test"}); err != nil {
+		t.Fatalf("register collab agent: %v", err)
+	}
+	task, err := s.delegateManager.Delegate(context.Background(), collab.ModeParallel, "test unified store", "input", []string{"agent-test"}, time.Second)
+	if err != nil {
+		t.Fatalf("delegate collab task: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		record, ok, err := a.TaskStore().Get(task.ID)
+		if err != nil {
+			t.Fatalf("get task store record: %v", err)
+		}
+		if ok && record.Status == taskstore.StatusCompleted {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for task store record: %s", task.ID)
+}
+
+func TestDefaultServerConfig(t *testing.T) {
+	cfg := DefaultServerConfig()
+	if cfg.Addr != "127.0.0.1:9090" {
+		t.Errorf("expected 127.0.0.1:9090, got %s", cfg.Addr)
+	}
+	if cfg.EnableCORS {
+		t.Error("CORS should be disabled by default (secure default)")
+	}
+	if cfg.RateLimit != 60 {
+		t.Errorf("expected 60, got %d", cfg.RateLimit)
+	}
+}
+
+func TestHandleRoot(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	s.handleRoot(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["name"] != "LuckyAgent API" {
+		t.Errorf("expected LuckyAgent API, got %v", resp["name"])
+	}
+}
+
+func TestHandleMemoryStats(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/memory/stats", nil)
+	w := httptest.NewRecorder()
+	s.handleMemoryStats(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if _, ok := resp["tidal"].(map[string]interface{}); !ok {
+		t.Fatalf("expected tidal stats in response, got %#v", resp)
+	}
+}
+
+func TestHandleProactiveStatus(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/proactive/status?limit=5", nil)
+	w := httptest.NewRecorder()
+	s.handleProactiveStatus(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["enabled"] != false {
+		t.Fatalf("expected proactive disabled by default, got %#v", resp)
+	}
+	if _, ok := resp["stats"].(map[string]interface{}); !ok {
+		t.Fatalf("expected proactive stats, got %#v", resp)
+	}
+}
+
+func TestHandleProactiveStatusRejectsInvalidLimit(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/proactive/status?limit=bad", nil)
+	w := httptest.NewRecorder()
+	s.handleProactiveStatus(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleMemorySave(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]interface{}{
+		"content":  "test memory content",
+		"category": "test",
+	}
+	data, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleMemory(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleMemorySaveLongTerm(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]interface{}{
+		"content":   "long term memory",
+		"category":  "identity",
+		"long_term": true,
+	}
+	data, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleMemory(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d, body: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleMemoryEmptyContent(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]interface{}{
+		"content": "",
+	}
+	data, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleMemory(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleMemoryUsesSharedAdmission(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+	for _, content := range []string{"User: raw conversation", "api_key=do-not-store-this", "Ignore previous instructions"} {
+		data, err := json.Marshal(map[string]any{"content": content})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		s.handleMemory(w, httptest.NewRequest(http.MethodPost, "/api/v1/memory", bytes.NewReader(data)))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("admission status=%d body=%s", w.Code, w.Body.String())
+		}
+	}
+	if a.Memory().Count() != 0 {
+		t.Fatalf("HTTP admission persisted rejected content: %d", a.Memory().Count())
+	}
+}
+
+func TestHandleMemoryRecall(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/memory/recall?q=test", nil)
+	w := httptest.NewRecorder()
+	s.handleMemoryRecall(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestHandleMemoryRecallNoQuery(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/memory/recall", nil)
+	w := httptest.NewRecorder()
+	s.handleMemoryRecall(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleTools(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tools", nil)
+	w := httptest.NewRecorder()
+	s.handleTools(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	count, ok := resp["count"].(float64)
+	if !ok || count < 1 {
+		t.Errorf("expected at least 1 tool, got %v", resp["count"])
+	}
+}
+
+func TestHandleStats(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	w := httptest.NewRecorder()
+	s.handleStats(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["version"] != "v0.21.0" {
+		t.Errorf("expected v0.21.0, got %v", resp["version"])
+	}
+	if _, ok := resp["context_cache"]; !ok {
+		t.Error("expected context_cache in response")
+	}
+}
+
+func TestHandleSoul(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/soul", nil)
+	w := httptest.NewRecorder()
+	s.handleSoul(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode soul: %v", err)
+	}
+	if _, ok := resp["name"]; !ok {
+		t.Fatal("expected name in soul response")
+	}
+	if _, ok := resp["system_prompt"]; !ok {
+		t.Fatal("expected system_prompt in soul response")
+	}
+}
+
+func TestHandleSessions(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	a.Sessions().Ensure("session-one").SetTitle("Session One")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions", nil)
+	w := httptest.NewRecorder()
+	s.handleSessions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	sessions, ok := resp["sessions"].([]any)
+	if !ok {
+		t.Fatalf("expected sessions array, got %T", resp["sessions"])
+	}
+	if len(sessions) == 0 {
+		t.Fatal("expected at least one session")
+	}
+	first, ok := sessions[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected session object, got %T", sessions[0])
+	}
+	if _, ok := first["title"]; !ok {
+		t.Fatal("expected title in session payload")
+	}
+}
+
+func TestHandleSessionsSearch(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	sess := a.Sessions().Ensure("resume-target")
+	sess.SetTitle("Resume Target")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions?q=resume", nil)
+	w := httptest.NewRecorder()
+	s.handleSessions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	sessions, ok := resp["sessions"].([]any)
+	if !ok || len(sessions) != 1 {
+		t.Fatalf("expected one matched session, got %v", resp["sessions"])
+	}
+	first, ok := sessions[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected session object, got %T", sessions[0])
+	}
+	if first["title"] != "Resume Target" {
+		t.Fatalf("expected title to match, got %v", first["title"])
+	}
+}
+
+func TestHandleSessionsPagination(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	a.Sessions().Ensure("session-a").SetTitle("Session A")
+	a.Sessions().Ensure("session-b").SetTitle("Session B")
+	a.Sessions().Ensure("session-c").SetTitle("Session C")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions?limit=2&offset=1", nil)
+	w := httptest.NewRecorder()
+	s.handleSessions(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	sessions, ok := resp["sessions"].([]any)
+	if !ok {
+		t.Fatalf("expected sessions array, got %T", resp["sessions"])
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("expected 2 paged sessions, got %d", len(sessions))
+	}
+	if resp["count"] != float64(2) {
+		t.Fatalf("expected count 2, got %v", resp["count"])
+	}
+	if resp["total"] != float64(3) {
+		t.Fatalf("expected total 3, got %v", resp["total"])
+	}
+	if resp["offset"] != float64(1) {
+		t.Fatalf("expected offset 1, got %v", resp["offset"])
+	}
+	if resp["limit"] != float64(2) {
+		t.Fatalf("expected limit 2, got %v", resp["limit"])
+	}
+	if resp["has_more"] != false {
+		t.Fatalf("expected has_more false, got %v", resp["has_more"])
+	}
+}
+
+func TestHandleTasksAPI(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+	record, err := a.TaskStore().Create(taskstore.Record{
+		ID:          "task-api-test",
+		Source:      taskstore.SourceHTTP,
+		Mode:        taskstore.ModeParallel,
+		Status:      taskstore.StatusCompleted,
+		Description: "test task api",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := a.TaskStore().AppendEvent(taskstore.Event{
+		Type:    taskstore.EventCompleted,
+		TaskID:  record.ID,
+		Status:  taskstore.StatusCompleted,
+		Message: "done",
+		Files:   []string{"internal/server/task_handlers.go"},
+	}); err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+	if err := a.TaskStore().SavePlannerTrace(record.ID, map[string]any{"planner": "test"}); err != nil {
+		t.Fatalf("save trace: %v", err)
+	}
+	if err := a.TaskStore().SaveResult(record.ID, "final task result"); err != nil {
+		t.Fatalf("save result: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks?source=http", nil)
+	w := httptest.NewRecorder()
+	s.handleTasks(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 list, got %d: %s", w.Code, w.Body.String())
+	}
+	var listResp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&listResp); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if listResp["count"] != float64(1) {
+		t.Fatalf("expected one task, got %+v", listResp)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-api-test", nil)
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 detail, got %d: %s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-api-test/events", nil)
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 events, got %d: %s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-api-test/trace", nil)
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 trace, got %d: %s", w.Code, w.Body.String())
+	}
+	var trace map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&trace); err != nil {
+		t.Fatalf("decode trace: %v", err)
+	}
+	if trace["planner"] != "test" {
+		t.Fatalf("unexpected trace: %+v", trace)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-api-test/result", nil)
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 result, got %d: %s", w.Code, w.Body.String())
+	}
+	var resultResp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resultResp); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if resultResp["result"] != "final task result" {
+		t.Fatalf("unexpected result: %+v", resultResp)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-api-test/observation", nil)
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 observation, got %d: %s", w.Code, w.Body.String())
+	}
+	var obs map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&obs); err != nil {
+		t.Fatalf("decode observation: %v", err)
+	}
+	if obs["recommended_next"] != "verify" {
+		t.Fatalf("expected verify recommendation, got %+v", obs)
+	}
+
+	child, err := a.TaskStore().Create(taskstore.Record{
+		ID:          "task-api-child",
+		ParentID:    record.ID,
+		Source:      taskstore.SourceTool,
+		Mode:        taskstore.ModeSingle,
+		Status:      taskstore.StatusRunning,
+		Description: "child task",
+	})
+	if err != nil {
+		t.Fatalf("create child task: %v", err)
+	}
+	if _, err := a.TaskStore().Create(taskstore.Record{
+		ID:          "task-api-grandchild",
+		ParentID:    child.ID,
+		Source:      taskstore.SourceTool,
+		Mode:        taskstore.ModeSingle,
+		Status:      taskstore.StatusPending,
+		Description: "grandchild task",
+	}); err != nil {
+		t.Fatalf("create grandchild task: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/tasks/task-api-test/tree", nil)
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 tree, got %d: %s", w.Code, w.Body.String())
+	}
+	var tree struct {
+		Task struct {
+			ID string `json:"id"`
+		} `json:"task"`
+		Children []struct {
+			Task struct {
+				ID string `json:"id"`
+			} `json:"task"`
+			Children []json.RawMessage `json:"children"`
+		} `json:"children"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&tree); err != nil {
+		t.Fatalf("decode task tree: %v", err)
+	}
+	if tree.Task.ID != record.ID || len(tree.Children) != 1 || tree.Children[0].Task.ID != child.ID || len(tree.Children[0].Children) != 1 {
+		t.Fatalf("unexpected task tree: %+v", tree)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks/task-api-test/feedback", bytes.NewBufferString(`{"status":"completed","verified":true,"verifier":"test","user_feedback":"accepted","score":0.9,"recommended_next":"finalize"}`))
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 feedback, got %d: %s", w.Code, w.Body.String())
+	}
+	updated, ok, err := a.TaskStore().Get(record.ID)
+	if err != nil || !ok {
+		t.Fatalf("get feedback task: ok=%t err=%v", ok, err)
+	}
+	if !updated.Outcome.Verified || updated.Outcome.UserFeedback != "accepted" || updated.Outcome.RecommendedNext != "finalize" {
+		t.Fatalf("unexpected outcome: %+v", updated.Outcome)
+	}
+	events, err := a.TaskStore().Events(record.ID)
+	if err != nil {
+		t.Fatalf("events after feedback: %v", err)
+	}
+	if events[len(events)-1].Type != taskstore.EventOutcomeRecorded {
+		t.Fatalf("expected outcome event, got %+v", events[len(events)-1])
+	}
+
+	cancelRecord, err := a.TaskStore().Create(taskstore.Record{
+		ID:          "task-cancel-test",
+		Source:      taskstore.SourceTool,
+		Mode:        taskstore.ModeSingle,
+		Status:      taskstore.StatusRunning,
+		Description: "cancel me",
+	})
+	if err != nil {
+		t.Fatalf("create cancel task: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/tasks/task-cancel-test/cancel", bytes.NewBufferString(`{"reason":"stop now"}`))
+	w = httptest.NewRecorder()
+	s.handleTaskByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 cancel, got %d: %s", w.Code, w.Body.String())
+	}
+	cancelled, ok, err := a.TaskStore().Get(cancelRecord.ID)
+	if err != nil || !ok {
+		t.Fatalf("get cancel task: ok=%t err=%v", ok, err)
+	}
+	if cancelled.Status != taskstore.StatusCancelled || cancelled.Outcome.UserFeedback != "stop now" {
+		t.Fatalf("unexpected cancelled task: %+v", cancelled)
+	}
+}
+
+func TestHandleSessionCompactDryRun(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	sess := a.Sessions().Ensure("compact-api-dry")
+	sess.AddMessage("user", "Fix internal/agent/context_planner.go and keep compact API dry-run safe.")
+	sess.AddToolMessage("terminal", "go test ./internal/server will verify dry-run compact behavior")
+	before := sess.MessageCount()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/compact-api-dry/compact", bytes.NewReader([]byte(`{"dry_run":true,"force_local":true}`)))
+	w := httptest.NewRecorder()
+	s.handleSessionByID(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := sess.MessageCount(); got != before {
+		t.Fatalf("dry-run must not append boundary: got %d messages, want %d", got, before)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["dry_run"] != true || resp["summary_source"] != "local" {
+		t.Fatalf("unexpected compact response: %+v", resp)
+	}
+}
+
+func TestHandleSessionCompactLatestTrace(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	sess := a.Sessions().Ensure("compact-api-write")
+	sess.AddMessage("user", "Fix internal/agent/context_planner.go and expose compact API trace.")
+	sess.AddToolMessage("terminal", "go test ./internal/server should pass for compact API trace")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/compact-api-write/compact", bytes.NewReader([]byte(`{"force_local":true}`)))
+	w := httptest.NewRecorder()
+	s.handleSessionByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/sessions/compact-api-write/compact/latest", nil)
+	w = httptest.NewRecorder()
+	s.handleSessionByID(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	trace, ok := resp["trace"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected trace object, got %+v", resp)
+	}
+	if trace["summary_source"] != "local" || trace["dropped_messages"] != float64(2) {
+		t.Fatalf("unexpected compact trace: %+v", trace)
+	}
+}
+
+func TestHandleChatSyncEmptyMessage(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]interface{}{
+		"message": "",
+	}
+	data, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/sync", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleChatSync(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleChatSyncInvalidBody(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/sync", bytes.NewReader([]byte("invalid json")))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleChatSync(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleChatSyncRunsLoopOncePerRequest(t *testing.T) {
+	var callCount atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	tmpDir := t.TempDir()
+	mgr, err := config.NewManagerWithDir(tmpDir)
+	if err != nil {
+		t.Fatalf("create config manager: %v", err)
+	}
+	if err := mgr.Set("provider", "openai"); err != nil {
+		t.Fatalf("set provider: %v", err)
+	}
+	if err := mgr.Set("api_key", "sk-test"); err != nil {
+		t.Fatalf("set api_key: %v", err)
+	}
+	if err := mgr.Set("api_base", upstream.URL); err != nil {
+		t.Fatalf("set api_base: %v", err)
+	}
+	if err := mgr.Set("model", "gpt-test"); err != nil {
+		t.Fatalf("set model: %v", err)
+	}
+
+	a, err := appboot.New(mgr)
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]any{
+		"message": "hello",
+	}
+	data, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat/sync", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleChatSync(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d, body=%s", w.Code, w.Body.String())
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 upstream call, got %d", got)
+	}
+}
+
+// ===== 中间件测试 =====
+
+func TestCORSMiddleware(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := DefaultServerConfig()
+	cfg.EnableCORS = true
+	cfg.CORSOrigins = []string{"http://localhost:3000"} // 显式配置允许的源
+	s := New(a, cfg)
+
+	handler := s.corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// OPTIONS 预检
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/health/live", nil)
+	req.Header.Set("Origin", "http://localhost:3000")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("expected 204, got %d", w.Code)
+	}
+	if w.Header().Get("Access-Control-Allow-Origin") == "" {
+		t.Error("CORS origin header should be set")
+	}
+}
+
+func TestCORSMiddlewareDisabled(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := DefaultServerConfig()
+	cfg.EnableCORS = false
+	s := New(a, cfg)
+
+	handler := s.corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/health/live", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// CORS 禁用时，OPTIONS 不应返回 204（无预检响应）
+	if w.Code == http.StatusNoContent {
+		t.Error("CORS disabled, OPTIONS should not return 204")
+	}
+	// 应该直接传给 next handler，返回 200
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 (passthrough), got %d", w.Code)
+	}
+	// 不应有 CORS headers
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Error("CORS headers should not be set when CORS is disabled")
+	}
+}
+
+func TestAuthMiddlewareNoKeys(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := DefaultServerConfig()
+	cfg.APIKeys = nil // 无 API Key
+	s := New(a, cfg)
+
+	called := false
+	handler := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// 来自 localhost 的请求应被允许
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if !called {
+		t.Error("handler should be called for localhost when no API keys configured")
+	}
+
+	// 来自外部 IP 的请求应被拒绝
+	called = false
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	req.RemoteAddr = "192.168.1.100:12345"
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if called {
+		t.Error("handler should NOT be called for external IP when no API keys configured")
+	}
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for external IP, got %d", w.Code)
+	}
+}
+
+func TestAuthMiddlewareWithKeys(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := DefaultServerConfig()
+	cfg.APIKeys = []string{"test-key-123"}
+	s := New(a, cfg)
+
+	handler := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// 无 API Key
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d", w.Code)
+	}
+
+	// 错误 API Key
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	req.Header.Set("X-API-Key", "wrong-key")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d", w.Code)
+	}
+
+	// 正确 API Key (Header)
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	req.Header.Set("X-API-Key", "test-key-123")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	// 正确 API Key (Bearer)
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	req.Header.Set("Authorization", "Bearer test-key-123")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	// Query string API Key 不再支持（安全原因）
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/stats?api_key=test-key-123", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for query string api_key (no longer supported), got %d", w.Code)
+	}
+}
+
+func TestAuthMiddlewareHealthEndpointBypass(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := DefaultServerConfig()
+	cfg.APIKeys = []string{"test-key-123"}
+	s := New(a, cfg)
+
+	handler := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// 健康检查不需要认证
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health/live", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("health endpoint should bypass auth, got %d", w.Code)
+	}
+
+	// 根路由不需要认证
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("root endpoint should bypass auth, got %d", w.Code)
+	}
+}
+
+func TestRateLimiter(t *testing.T) {
+	rl := newRateLimiter(3)
+
+	for i := 0; i < 3; i++ {
+		if !rl.Allow("127.0.0.1") {
+			t.Errorf("request %d should be allowed", i+1)
+		}
+	}
+
+	if rl.Allow("127.0.0.1") {
+		t.Error("4th request should be rate limited")
+	}
+
+	// 不同 IP 应该独立计数
+	if !rl.Allow("192.168.1.1") {
+		t.Error("different IP should be allowed")
+	}
+}
+
+func TestRateLimitMiddleware(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := DefaultServerConfig()
+	cfg.RateLimit = 2
+	s := New(a, cfg)
+
+	handler := s.rateLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// 前两个请求应该通过
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/health/live", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("request %d should be allowed, got %d", i+1, w.Code)
+		}
+	}
+
+	// 第三个应该被限流
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health/live", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("expected 429, got %d", w.Code)
+	}
+}
+
+func TestRecoveryMiddleware(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	handler := s.recoveryMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("test panic")
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/test", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestServerStartStop(t *testing.T) {
+	a := createTestAgent(t)
+	cfg := ServerConfig{
+		Addr:       ":0", // 随机端口
+		EnableCORS: true,
+		RateLimit:  60,
+	}
+	s := New(a, cfg)
+
+	if err := s.Start(); err != nil {
+		t.Fatalf("start server: %v", err)
+	}
+
+	if !s.IsRunning() {
+		t.Error("server should be running")
+	}
+
+	// 重复启动应报错
+	if err := s.Start(); err == nil {
+		t.Error("starting already running server should fail")
+	}
+
+	// 等待服务启动
+	time.Sleep(100 * time.Millisecond)
+
+	if err := s.Stop(); err != nil {
+		t.Fatalf("stop server: %v", err)
+	}
+
+	if s.IsRunning() {
+		t.Error("server should not be running after stop")
+	}
+}
+
+func TestServerStats(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	stats := s.Stats()
+	if stats.TotalReqs != 0 {
+		t.Errorf("initial total requests should be 0, got %d", stats.TotalReqs)
+	}
+	if stats.StartTime.IsZero() {
+		t.Error("start time should not be zero")
+	}
+}
+
+func TestChatRequestTracksExplicitAutoApprove(t *testing.T) {
+	var omitted ChatRequest
+	if err := jsonAPI.Unmarshal([]byte(`{"message":"hello"}`), &omitted); err != nil {
+		t.Fatal(err)
+	}
+	if omitted.autoApproveSet {
+		t.Fatal("auto_approve should be unset when omitted")
+	}
+
+	var explicit ChatRequest
+	if err := jsonAPI.Unmarshal([]byte(`{"message":"hello","auto_approve":false}`), &explicit); err != nil {
+		t.Fatal(err)
+	}
+	if !explicit.autoApproveSet {
+		t.Fatal("auto_approve should be marked as explicitly supplied")
+	}
+}
+
+func TestChatEventTypeString(t *testing.T) {
+	tests := []struct {
+		input    agent.ChatEventType
+		expected string
+	}{
+		{agent.ChatEventThinking, "reason"},
+		{agent.ChatEventToolCall, "act"},
+		{agent.ChatEventToolResult, "observe"},
+		{agent.ChatEventContent, "content"},
+		{agent.ChatEventDone, "done"},
+		{agent.ChatEventError, "error"},
+		{agent.ChatEventCompact, "compact"},
+		{99, "unknown"}, // Unknown
+	}
+
+	for _, tt := range tests {
+		result := chatEventTypeString(tt.input)
+		if result != tt.expected {
+			t.Errorf("chatEventTypeString(%d) = %s, want %s", tt.input, result, tt.expected)
+		}
+	}
+}
+
+func TestPermString(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    int
+		expected string
+	}{
+		{"auto", 0, "auto"},
+		{"approve", 1, "approve"},
+		{"deny", 2, "deny"},
+		{"unknown", 99, "unknown"},
+	}
+
+	for _, tt := range tests {
+		result := permString(tool.PermissionLevel(tt.input))
+		if result != tt.expected {
+			t.Errorf("permString(%s) = %s, want %s", tt.name, result, tt.expected)
+		}
+	}
+}
+
+func TestSendJSON(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	w := httptest.NewRecorder()
+	s.sendJSON(w, http.StatusOK, map[string]string{"hello": "world"})
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Errorf("expected json content type, got %s", ct)
+	}
+}
+
+func TestSendError(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	w := httptest.NewRecorder()
+	s.sendError(w, "test error", http.StatusBadRequest, "details")
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+
+	var resp ErrorResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Error != "test error" {
+		t.Errorf("expected 'test error', got %s", resp.Error)
+	}
+	if resp.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", resp.Code)
+	}
+	if resp.Details != "details" {
+		t.Errorf("expected 'details', got %s", resp.Details)
+	}
+}
+
+// --- RAG Handler Tests ---
+
+func TestHandleRAGIndexText(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]string{
+		"source":  "test-doc",
+		"title":   "Test Document",
+		"content": "This is a test document for RAG indexing. It contains some text to be chunked and embedded.",
+	}
+	b, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/index", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	s.handleRAGIndex(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["action"] != "index_text" {
+		t.Errorf("expected action=index_text, got %v", resp["action"])
+	}
+	if resp["doc_id"] == nil {
+		t.Error("expected doc_id to be set")
+	}
+}
+
+func TestHandleRAGIndexMissingFields(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]string{}
+	b, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/index", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	s.handleRAGIndex(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleRAGIndexMethodNotAllowed(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rag/index", nil)
+	w := httptest.NewRecorder()
+
+	s.handleRAGIndex(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestHandleRAGIndexDelete(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	// First index a document
+	body := map[string]string{
+		"source":  "delete-test",
+		"title":   "Delete Test",
+		"content": "Document to be deleted from the index.",
+	}
+	b, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/index", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleRAGIndex(w, req)
+
+	var indexResp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&indexResp)
+	docID, _ := indexResp["doc_id"].(string)
+
+	// Now delete it
+	delBody := map[string]string{"doc_id": docID}
+	b, _ = json.Marshal(delBody)
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/rag/index", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	s.handleRAGIndex(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if removed, ok := resp["removed"].(bool); !ok || !removed {
+		t.Errorf("expected removed=true, got %v", resp["removed"])
+	}
+}
+
+func TestHandleRAGSearch(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	// Index a document first
+	body := map[string]string{
+		"source":  "search-test",
+		"title":   "Search Test",
+		"content": "Go is a statically typed compiled programming language designed at Google.",
+	}
+	b, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/index", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleRAGIndex(w, req)
+
+	// Now search
+	searchBody := map[string]interface{}{
+		"query": "programming language",
+		"top_k": 3,
+	}
+	b, _ = json.Marshal(searchBody)
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/rag/search", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	s.handleRAGSearch(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["query"] != "programming language" {
+		t.Errorf("expected query=programming language, got %v", resp["query"])
+	}
+}
+
+func TestHandleRAGSearchNoQuery(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	body := map[string]string{}
+	b, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/search", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	s.handleRAGSearch(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleRAGSearchOptionsDoNotMutateGlobalRetriever(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+	if _, err := a.RAG().IndexText("isolated-source", "Isolated", "search option isolation evidence"); err != nil {
+		t.Fatal(err)
+	}
+	before := a.RAG().RetrieverConfig()
+	body := map[string]any{
+		"query":      "isolation evidence",
+		"top_k":      1,
+		"min_score":  0.8,
+		"source":     "isolated-source",
+		"use_mmr":    true,
+		"mmr_lambda": 0.4,
+	}
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/search", bytes.NewReader(b))
+	w := httptest.NewRecorder()
+	s.handleRAGSearch(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	after := a.RAG().RetrieverConfig()
+	if after != before {
+		t.Fatalf("per-request options mutated global retriever: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestHandleRAGSearchRejectsUnsafeOptions(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+	b, _ := json.Marshal(map[string]any{"query": "test", "top_k": 21})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/search", bytes.NewReader(b))
+	w := httptest.NewRecorder()
+	s.handleRAGSearch(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleRAGSearchMethodNotAllowed(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/rag/search", nil)
+	w := httptest.NewRecorder()
+
+	s.handleRAGSearch(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestHandleRAGStats(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	// Index a document first
+	body := map[string]string{
+		"source":  "stats-test",
+		"title":   "Stats Test",
+		"content": "Some content for stats testing.",
+	}
+	b, _ := json.Marshal(body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/index", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleRAGIndex(w, req)
+
+	// Get stats
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/rag/stats", nil)
+	w = httptest.NewRecorder()
+	s.handleRAGStats(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["document_count"] == nil {
+		t.Error("expected document_count to be set")
+	}
+	if resp["chunk_count"] == nil {
+		t.Error("expected chunk_count to be set")
+	}
+}
+
+func TestHandleRAGStatsMethodNotAllowed(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/stats", nil)
+	w := httptest.NewRecorder()
+
+	s.handleRAGStats(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestServerStartBindFailureDoesNotReportRunning(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	a := createTestAgent(t)
+	s := New(a, ServerConfig{Addr: ln.Addr().String(), EnableCORS: true, RateLimit: 60})
+
+	err = s.Start()
+	if err == nil {
+		t.Fatal("expected bind failure when the address is already in use")
+	}
+	if !strings.Contains(err.Error(), "address already in use") && !strings.Contains(err.Error(), "bind") {
+		t.Fatalf("expected a bind error, got %v", err)
+	}
+	if s.IsRunning() {
+		t.Fatal("server must not be marked running when listen fails")
+	}
+}
+
+func TestPublicServerURL(t *testing.T) {
+	if got := publicServerURL("127.0.0.1:9090"); got != "http://127.0.0.1:9090" {
+		t.Fatalf("loopback url = %q", got)
+	}
+	if got := publicServerURL(":9090"); got != "http://localhost:9090" {
+		t.Fatalf("wildcard url = %q", got)
+	}
+	if got := publicServerURL("127.0.0.1:9090"); strings.Contains(got, "localhost127") {
+		t.Fatalf("malformed concat leaked: %q", got)
+	}
+}

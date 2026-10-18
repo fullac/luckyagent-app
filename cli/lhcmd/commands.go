@@ -1,0 +1,2397 @@
+package lhcmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	appboot "github.com/yurika0211/luckyagent-app/bootstrap"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/yurika0211/lucky-agent/agent"
+	"github.com/yurika0211/luckyagent-app/appservice"
+	"github.com/yurika0211/luckyagent-app/gateway/qqofficial"
+	"github.com/yurika0211/luckyagent-app/gateway/telegram"
+	"github.com/yurika0211/luckyagent-app/server"
+	"github.com/yurika0211/luckyagent-runtime/config"
+	"github.com/yurika0211/luckyagent-runtime/gateway"
+	luckycollector "github.com/yurika0211/luckyagent-runtime/gateway/collector"
+	"github.com/yurika0211/luckyagent-runtime/gateway/feishu"
+	"github.com/yurika0211/luckyagent-runtime/gateway/napcat"
+	"github.com/yurika0211/luckyagent-runtime/gateway/openclawweixin"
+	"github.com/yurika0211/luckyagent-runtime/gateway/weixin"
+	"github.com/yurika0211/luckyagent-runtime/memoryaestus"
+	"github.com/yurika0211/luckyagent-runtime/proactive"
+	"github.com/yurika0211/luckyagent-runtime/soul"
+	"github.com/yurika0211/luckyagent-runtime/tool"
+	"github.com/yurika0211/luckyagent-tools/cron"
+	"github.com/yurika0211/luckyagent-tools/memory"
+)
+
+var (
+	soulFile  string
+	provider_ string
+	model_    string
+	yolo      bool
+)
+
+const msgGatewayShutdownTimeout = 2 * time.Second
+
+func runInit(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.InitHome(); err != nil {
+		return err
+	}
+
+	// Installers and Configuration Center call `lh init` on every start.
+	// Never clobber an existing user config with DefaultConfig().
+	cfgPath := mgr.ConfigFile()
+	if _, err := os.Stat(cfgPath); err == nil {
+		fmt.Println("LuckyAgent 主目录已就绪（保留现有配置）")
+		fmt.Printf("主目录: %s\n", mgr.HomeDir())
+		fmt.Printf("配置: %s\n", cfgPath)
+		return nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat config: %w", err)
+	}
+
+	if err := mgr.Save(); err != nil {
+		return err
+	}
+
+	fmt.Println("LuckyAgent 初始化完成")
+	fmt.Printf("主目录: %s\n", mgr.HomeDir())
+	fmt.Println("下一步:")
+	fmt.Println("  la credential add openai-main --kind llm_api_key")
+	fmt.Println("  la config set models.endpoints.chat.credential_ref openai-main")
+	fmt.Println("  la config set provider openai")
+	fmt.Println("  la chat")
+	return nil
+}
+
+func runChat(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	if provider_ != "" {
+		_ = mgr.Set("provider", provider_)
+	}
+	if model_ != "" {
+		_ = mgr.Set("model", model_)
+	}
+	if soulFile != "" {
+		_ = mgr.Set("soul_path", soulFile)
+	}
+
+	userInput := strings.Join(args, " ")
+	trimmedInput := strings.TrimSpace(userInput)
+	if userInput == "" {
+		return startREPL(mgr)
+	}
+
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return fmt.Errorf("create agent: %w", err)
+	}
+	defer a.Close()
+
+	loopCfg := agent.DefaultLoopConfig()
+	cfg := mgr.Get()
+	agent.ApplyAgentLoopConfig(&loopCfg, cfg.Agent)
+	loopCfg.Source = "cli"
+	if cmd.Flags().Changed("yolo") {
+		loopCfg.AutoApprove = yolo
+	}
+
+	if strings.HasPrefix(trimmedInput, "/") {
+		sessionMgr := a.Sessions()
+		if sessionMgr == nil {
+			return fmt.Errorf("session manager is not initialized")
+		}
+		currentSession := sessionMgr.New()
+		cronEngine := a.CronEngine()
+		cronStore := a.CronStore()
+		watcher := cron.NewWatcher(cronEngine)
+		handled, exit := executeSingleCommand(trimmedInput, a, &loopCfg, cronEngine, cronStore, watcher, sessionMgr, &currentSession, mgr)
+		if !handled {
+			return nil
+		}
+		if exit {
+			return nil
+		}
+		return nil
+	}
+
+	sess := a.Sessions().New()
+	plainText, attachments := parseAttachmentsFromInput(userInput)
+	var turn agent.UserTurnInput
+	if len(attachments) > 0 {
+		turn = agent.MultimodalUserTurnInput(plainText, attachments)
+	} else {
+		turn = agent.TextUserTurnInput(userInput)
+	}
+	result, err := runChatStreamInput(context.Background(), a, sess, turn, loopCfg)
+	if err != nil {
+		return fmt.Errorf("chat: %w", err)
+	}
+
+	fmt.Println(result.Response)
+	return nil
+}
+
+func runConfigGet(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	cfg := mgr.Get()
+	if value, handled, err := config.RedactSecrets(cfg).ModelConfigValue(args[0]); handled {
+		if err != nil {
+			return err
+		}
+		fmt.Println(value)
+		return nil
+	}
+	if strings.HasPrefix(args[0], "tool_trace.templates.") {
+		toolName := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(args[0], "tool_trace.templates.")))
+		if value, ok := cfg.ToolTrace.Templates[toolName]; ok {
+			fmt.Println(value)
+		} else {
+			fmt.Println("(未设置)")
+		}
+		return nil
+	}
+	switch args[0] {
+	case "provider":
+		fmt.Println(cfg.Provider)
+	case "api_key":
+		fmt.Println(maskKey(cfg.APIKey))
+	case "api_base":
+		fmt.Println(cfg.APIBase)
+	case "model":
+		fmt.Println(cfg.Model)
+	case "protocol", "llm_provider.protocol":
+		fmt.Println(cfg.LlmProvider.Protocol)
+	case "embedding.model":
+		fmt.Println(cfg.Embedding.Model)
+	case "embedding.api_base":
+		fmt.Println(cfg.Embedding.APIBase)
+	case "embedding.dimension":
+		fmt.Println(cfg.Embedding.Dimension)
+	case "embedding.api_key":
+		fmt.Println(maskKey(cfg.Embedding.APIKey))
+	case "multimodal.provider":
+		fmt.Println(cfg.Multimodal.Provider)
+	case "multimodal.api_key":
+		fmt.Println(maskKey(cfg.Multimodal.APIKey))
+	case "multimodal.api_base":
+		fmt.Println(cfg.Multimodal.APIBase)
+	case "multimodal.image_model":
+		fmt.Println(cfg.Multimodal.ImageModel)
+	case "multimodal.transcription_model":
+		fmt.Println(cfg.Multimodal.TranscriptionModel)
+	case "multimodal.image_provider":
+		fmt.Println(cfg.Multimodal.ImageProvider)
+	case "soul_path":
+		fmt.Println(cfg.SoulPath)
+	case "max_tokens":
+		fmt.Println(cfg.MaxTokens)
+	case "temperature":
+		fmt.Println(cfg.Temperature)
+	case "context.memory_hygiene_before_context":
+		fmt.Println(cfg.Context.MemoryHygieneBeforeContext)
+	case "context.memory_hygiene_action":
+		fmt.Println(cfg.Context.MemoryHygieneAction)
+	case "context.memory_hygiene_min_severity":
+		fmt.Println(cfg.Context.MemoryHygieneMinSeverity)
+	case "context.memory_hygiene_max_findings":
+		fmt.Println(cfg.Context.MemoryHygieneMaxFindings)
+	case "delegate.max_concurrent":
+		fmt.Println(cfg.Delegate.MaxConcurrent)
+	case "delegate.timeout_seconds":
+		fmt.Println(cfg.Delegate.TimeoutSeconds)
+	case "delegate.min_timeout_seconds":
+		fmt.Println(cfg.Delegate.MinTimeoutSeconds)
+	case "delegate.max_timeout_seconds":
+		fmt.Println(cfg.Delegate.MaxTimeoutSeconds)
+	case "delegate.max_result_bytes_inline":
+		fmt.Println(cfg.Delegate.MaxResultBytesInline)
+	case "delegate.max_children":
+		fmt.Println(cfg.Delegate.MaxChildren)
+	case "delegate.child.max_iterations":
+		fmt.Println(cfg.Delegate.Child.MaxIterations)
+	case "delegate.child.timeout_seconds":
+		fmt.Println(cfg.Delegate.Child.TimeoutSeconds)
+	case "delegate.child.auto_approve":
+		fmt.Println(delegateChildAutoApprove(cfg))
+	case "delegate.child.repeat_tool_call_limit":
+		fmt.Println(cfg.Delegate.Child.RepeatToolCallLimit)
+	case "delegate.child.tool_only_iteration_limit":
+		fmt.Println(cfg.Delegate.Child.ToolOnlyIterationLimit)
+	case "delegate.child.duplicate_fetch_limit":
+		fmt.Println(cfg.Delegate.Child.DuplicateFetchLimit)
+	case "delegate.child.disabled_tools":
+		fmt.Println(strings.Join(cfg.Delegate.Child.DisabledTools, ","))
+	case "delegate.child.allow_recursive_delegate":
+		fmt.Println(cfg.Delegate.Child.AllowRecursiveDelegate)
+	case "autonomy.enabled":
+		fmt.Println(cfg.Autonomy.Enabled)
+	case "autonomy.queue_buffer":
+		fmt.Println(cfg.Autonomy.QueueBuffer)
+	case "autonomy.pool.max_workers":
+		fmt.Println(cfg.Autonomy.Pool.MaxWorkers)
+	case "autonomy.pool.queue_buffer":
+		fmt.Println(cfg.Autonomy.Pool.QueueBuffer)
+	case "autonomy.pool.auto_scale":
+		fmt.Println(cfg.Autonomy.Pool.AutoScale)
+	case "autonomy.pool.min_workers":
+		fmt.Println(cfg.Autonomy.Pool.MinWorkers)
+	case "autonomy.worker.max_iterations":
+		fmt.Println(cfg.Autonomy.Worker.MaxIterations)
+	case "autonomy.worker.timeout_seconds":
+		fmt.Println(cfg.Autonomy.Worker.TimeoutSeconds)
+	case "autonomy.worker.auto_approve":
+		if cfg.Autonomy.Worker.AutoApprove == nil {
+			fmt.Println(false)
+		} else {
+			fmt.Println(*cfg.Autonomy.Worker.AutoApprove)
+		}
+	case "autonomy.worker.repeat_tool_call_limit":
+		fmt.Println(cfg.Autonomy.Worker.RepeatToolCallLimit)
+	case "autonomy.worker.tool_only_iteration_limit":
+		fmt.Println(cfg.Autonomy.Worker.ToolOnlyIterationLimit)
+	case "autonomy.worker.duplicate_fetch_limit":
+		fmt.Println(cfg.Autonomy.Worker.DuplicateFetchLimit)
+	case "autonomy.worker.disabled_tools":
+		fmt.Println(strings.Join(cfg.Autonomy.Worker.DisabledTools, ","))
+	case "autonomy.heartbeat.mode":
+		fmt.Println(cfg.Autonomy.Heartbeat.Mode)
+	case "autonomy.heartbeat.interval_seconds":
+		fmt.Println(cfg.Autonomy.Heartbeat.IntervalSeconds)
+	case "autonomy.heartbeat.active_start":
+		fmt.Println(cfg.Autonomy.Heartbeat.ActiveStart)
+	case "autonomy.heartbeat.active_end":
+		fmt.Println(cfg.Autonomy.Heartbeat.ActiveEnd)
+	case "autonomy.heartbeat.max_tasks_per_beat":
+		fmt.Println(cfg.Autonomy.Heartbeat.MaxTasksPerBeat)
+	case "memory.tidal.enabled":
+		fmt.Println(cfg.Memory.Tidal.Enabled)
+	case "memory.tidal.beta":
+		fmt.Println(cfg.Memory.Tidal.Beta)
+	case "memory.tidal.max_boost":
+		fmt.Println(cfg.Memory.Tidal.MaxBoost)
+	case "memory.tidal.learning_rate":
+		fmt.Println(cfg.Memory.Tidal.LearningRate)
+	case "memory.tidal.min_samples":
+		fmt.Println(cfg.Memory.Tidal.MinSamples)
+	case "memory.tidal.store_path":
+		fmt.Println(cfg.Memory.Tidal.StorePath)
+	case "proactive.enabled":
+		fmt.Println(cfg.Proactive.Enabled)
+	case "proactive.dry_run":
+		fmt.Println(proactiveDryRunEnabled(cfg))
+	case "proactive.confidence_threshold":
+		fmt.Println(cfg.Proactive.ConfidenceThreshold)
+	case "proactive.horizon_seconds":
+		fmt.Println(cfg.Proactive.HorizonSeconds)
+	case "proactive.store_path":
+		fmt.Println(cfg.Proactive.StorePath)
+	case "proactive.action_interval_seconds":
+		fmt.Println(cfg.Proactive.ActionIntervalSecs)
+	case "proactive.max_actions":
+		fmt.Println(cfg.Proactive.MaxActions)
+	case "proactive.action_cooldown_seconds":
+		fmt.Println(cfg.Proactive.ActionCooldownSecs)
+	case "proactive.allowed_actions":
+		fmt.Println(strings.Join(cfg.Proactive.AllowedActions, ","))
+	case "proactive.kernel_learning_enabled":
+		fmt.Println(proactiveKernelLearningEnabled(cfg))
+	case "proactive.kernel_learning_rate":
+		fmt.Println(cfg.Proactive.KernelLearningRate)
+	case "proactive.kernel_min_samples":
+		fmt.Println(cfg.Proactive.KernelMinSamples)
+	case "tools.filesystem.allowed_read_roots":
+		fmt.Println(strings.Join(cfg.Tools.Filesystem.AllowedReadRoots, ","))
+	case "tools.computer_use.enabled":
+		fmt.Println(cfg.Tools.ComputerUse.Enabled)
+	case "tools.computer_use.mode":
+		fmt.Println(cfg.Tools.ComputerUse.Mode)
+	case "tools.computer_use.backend":
+		fmt.Println(cfg.Tools.ComputerUse.Backend)
+	case "tools.computer_use.capture_dir":
+		fmt.Println(cfg.Tools.ComputerUse.CaptureDir)
+	case "tools.computer_use.allowed_sources":
+		fmt.Println(strings.Join(cfg.Tools.ComputerUse.AllowedSources, ","))
+	case "tools.computer_use.allowed_windows":
+		fmt.Println(strings.Join(cfg.Tools.ComputerUse.AllowedWindows, ","))
+	case "tools.computer_use.require_approval":
+		fmt.Println(cfg.Tools.ComputerUse.RequireApproval)
+	case "tools.computer_use.max_steps":
+		fmt.Println(cfg.Tools.ComputerUse.MaxSteps)
+	case "tools.computer_use.max_consecutive_observe_only":
+		fmt.Println(cfg.Tools.ComputerUse.MaxConsecutiveObserveOnly)
+	case "tools.computer_use.timeout_seconds":
+		fmt.Println(cfg.Tools.ComputerUse.TimeoutSeconds)
+	case "tools.computer_use.step_timeout_seconds":
+		fmt.Println(cfg.Tools.ComputerUse.StepTimeoutSeconds)
+	case "tools.computer_use.settle_ms", "tools.computer_use.settle_milliseconds":
+		fmt.Println(cfg.Tools.ComputerUse.SettleMilliseconds)
+	case "tools.computer_use.max_observation_bytes":
+		fmt.Println(cfg.Tools.ComputerUse.MaxObservationBytes)
+	case "tools.computer_use.max_screenshot_width":
+		fmt.Println(cfg.Tools.ComputerUse.MaxScreenshotWidth)
+	case "tools.computer_use.max_batch_actions":
+		fmt.Println(cfg.Tools.ComputerUse.MaxBatchActions)
+	case "tools.computer_use.settle_mode":
+		fmt.Println(cfg.Tools.ComputerUse.SettleMode)
+	case "tools.computer_use.keep_frames", "tools.computer_use.retain_frames":
+		fmt.Println(cfg.Tools.ComputerUse.KeepFrames)
+	case "tools.computer_use.frame_ttl_seconds":
+		fmt.Println(cfg.Tools.ComputerUse.FrameTTLSeconds)
+	case "tools.computer_use.allow_text_input":
+		fmt.Println(cfg.Tools.ComputerUse.AllowTextInput)
+	case "tools.computer_use.allow_high_risk_actions":
+		fmt.Println(cfg.Tools.ComputerUse.AllowHighRiskActions)
+	case "msg_gateway.platform":
+		fmt.Println(cfg.MsgGateway.Platform)
+	case "msg_gateway.api_addr":
+		fmt.Println(cfg.MsgGateway.APIAddr)
+	case "msg_gateway.telegram.proxy":
+		fmt.Println(cfg.MsgGateway.Telegram.Proxy)
+	case "msg_gateway.telegram.progress_summary_with_llm":
+		fmt.Println(cfg.MsgGateway.Telegram.ProgressSummaryWithLLM)
+	case "msg_gateway.telegram.progress_summary_prompt":
+		fmt.Println(cfg.MsgGateway.Telegram.ProgressSummaryPrompt)
+	case "msg_gateway.telegram.show_tool_details_in_result", "msg_gateway.telegram.show_tool_chain":
+		fmt.Println(cfg.MsgGateway.Telegram.ShowToolDetailsInResult)
+	case "msg_gateway.telegram.disable_auto_reaction":
+		fmt.Println(cfg.MsgGateway.Telegram.DisableAutoReaction)
+	case "msg_gateway.telegram.max_concurrent_sessions":
+		fmt.Println(cfg.MsgGateway.Telegram.MaxConcurrentSessions)
+	case "msg_gateway.qqofficial.app_id":
+		fmt.Println(cfg.MsgGateway.QQOfficial.AppID)
+	case "msg_gateway.qqofficial.app_secret":
+		fmt.Println(maskKey(cfg.MsgGateway.QQOfficial.AppSecret))
+	case "msg_gateway.qqofficial.proxy":
+		fmt.Println(cfg.MsgGateway.QQOfficial.Proxy)
+	case "msg_gateway.qqofficial.sandbox":
+		fmt.Println(cfg.MsgGateway.QQOfficial.Sandbox)
+	case "msg_gateway.qqofficial.api_base_url":
+		fmt.Println(cfg.MsgGateway.QQOfficial.APIBaseURL)
+	case "msg_gateway.qqofficial.gateway_url":
+		fmt.Println(cfg.MsgGateway.QQOfficial.GatewayURL)
+	case "msg_gateway.napcat.listen_addr":
+		fmt.Println(cfg.MsgGateway.NapCat.ListenAddr)
+	case "msg_gateway.napcat.path":
+		fmt.Println(cfg.MsgGateway.NapCat.Path)
+	case "msg_gateway.napcat.access_token":
+		fmt.Println(maskKey(cfg.MsgGateway.NapCat.AccessToken))
+	case "msg_gateway.napcat.group_trigger_mode":
+		fmt.Println(cfg.MsgGateway.NapCat.GroupTriggerMode)
+	case "msg_gateway.napcat.cross_group_read.enabled":
+		fmt.Println(cfg.MsgGateway.NapCat.CrossGroupRead.Enabled)
+	case "msg_gateway.napcat.cross_group_read.require_confirmation":
+		fmt.Println(cfg.MsgGateway.NapCat.CrossGroupRead.RequireConfirmation)
+	case "msg_gateway.napcat.cross_group_read.allowed_groups":
+		fmt.Println(strings.Join(cfg.MsgGateway.NapCat.CrossGroupRead.AllowedGroups, ","))
+	case "msg_gateway.napcat.cross_group_read.blocked_groups":
+		fmt.Println(strings.Join(cfg.MsgGateway.NapCat.CrossGroupRead.BlockedGroups, ","))
+	case "msg_gateway.napcat.cross_group_read.log_access":
+		fmt.Println(cfg.MsgGateway.NapCat.CrossGroupRead.LogAccess)
+	case "msg_gateway.feishu.app_id":
+		fmt.Println(cfg.MsgGateway.Feishu.AppID)
+	case "msg_gateway.feishu.app_secret":
+		fmt.Println(maskKey(cfg.MsgGateway.Feishu.AppSecret))
+	case "msg_gateway.feishu.verification_token":
+		fmt.Println(maskKey(cfg.MsgGateway.Feishu.VerificationToken))
+	case "msg_gateway.feishu.encrypt_key":
+		fmt.Println(maskKey(cfg.MsgGateway.Feishu.EncryptKey))
+	case "msg_gateway.feishu.render_mode":
+		fmt.Println(cfg.MsgGateway.Feishu.RenderMode)
+	case "msg_gateway.feishu.media_enabled":
+		fmt.Println(cfg.MsgGateway.Feishu.MediaEnabled)
+	case "msg_gateway.feishu.max_media_bytes":
+		fmt.Println(cfg.MsgGateway.Feishu.MaxMediaBytes)
+	case "msg_gateway.feishu.card_progress":
+		fmt.Println(cfg.MsgGateway.Feishu.CardProgress)
+	case "msg_gateway.feishu.listen_addr":
+		fmt.Println(cfg.MsgGateway.Feishu.ListenAddr)
+	case "msg_gateway.feishu.path":
+		fmt.Println(cfg.MsgGateway.Feishu.Path)
+	case "msg_gateway.feishu.api_base_url":
+		fmt.Println(cfg.MsgGateway.Feishu.APIBaseURL)
+	case "msg_gateway.feishu.allowed_chats":
+		fmt.Println(strings.Join(cfg.MsgGateway.Feishu.AllowedChats, ","))
+	case "msg_gateway.feishu.allowed_users":
+		fmt.Println(strings.Join(cfg.MsgGateway.Feishu.AllowedUsers, ","))
+	case "msg_gateway.feishu.remove_at":
+		fmt.Println(cfg.MsgGateway.Feishu.RemoveAt)
+	case "msg_gateway.feishu.group_trigger_mode":
+		fmt.Println(cfg.MsgGateway.Feishu.GroupTriggerMode)
+	default:
+		if v, ok := cfg.Extra[args[0]]; ok {
+			fmt.Println(v)
+		} else {
+			fmt.Println("(未设置)")
+		}
+	}
+	return nil
+}
+
+func runConfigSet(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	if err := appservice.SaveSettings(mgr, appservice.Setting{Key: args[0], Value: args[1]}); err != nil {
+		return err
+	}
+	if isSensitiveConfigKey(args[0]) {
+		fmt.Printf("%s = (已设置)\n", args[0])
+	} else {
+		fmt.Printf("%s = %s\n", args[0], args[1])
+	}
+	return nil
+}
+
+func isSensitiveConfigKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for _, marker := range []string{"api_key", "token", "secret", "password", "access_token", "encrypt_key"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func runConfigList(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	cfg := mgr.Get()
+	fmt.Println("LuckyAgent 配置:")
+	fmt.Printf("  provider: %s\n", cfg.Provider)
+	fmt.Printf("  api_key: %s\n", maskKey(cfg.APIKey))
+	fmt.Printf("  credential_ref: %s\n", cfg.ModelEndpoint(config.ModelKindChat).CredentialRef)
+	fmt.Printf("  api_base: %s\n", cfg.APIBase)
+	fmt.Printf("  model: %s\n", cfg.Model)
+	fmt.Printf("  soul_path: %s\n", cfg.SoulPath)
+	fmt.Printf("  max_tokens: %d\n", cfg.MaxTokens)
+	fmt.Printf("  temperature: %.1f\n", cfg.Temperature)
+	fmt.Printf("  delegate.max_concurrent: %d\n", cfg.Delegate.MaxConcurrent)
+	fmt.Printf("  delegate.timeout_seconds: %d\n", cfg.Delegate.TimeoutSeconds)
+	fmt.Printf("  delegate.max_children: %d\n", cfg.Delegate.MaxChildren)
+	fmt.Printf("  delegate.child.max_iterations: %d\n", cfg.Delegate.Child.MaxIterations)
+	fmt.Printf("  delegate.child.timeout_seconds: %d\n", cfg.Delegate.Child.TimeoutSeconds)
+	fmt.Printf("  delegate.child.auto_approve: %t\n", delegateChildAutoApprove(cfg))
+	fmt.Printf("  autonomy.enabled: %t\n", cfg.Autonomy.Enabled)
+	fmt.Printf("  autonomy.worker.max_iterations: %d\n", cfg.Autonomy.Worker.MaxIterations)
+	fmt.Printf("  autonomy.worker.timeout_seconds: %d\n", cfg.Autonomy.Worker.TimeoutSeconds)
+	fmt.Printf("  autonomy.worker.auto_approve: %t\n", autonomyWorkerAutoApprove(cfg))
+	fmt.Printf("  autonomy.pool.max_workers: %d\n", cfg.Autonomy.Pool.MaxWorkers)
+	fmt.Printf("  autonomy.heartbeat.interval_seconds: %d\n", cfg.Autonomy.Heartbeat.IntervalSeconds)
+	fmt.Printf("  memory.tidal.enabled: %t\n", cfg.Memory.Tidal.Enabled)
+	fmt.Printf("  memory.tidal.beta: %.2f\n", cfg.Memory.Tidal.Beta)
+	fmt.Printf("  memory.tidal.max_boost: %.2f\n", cfg.Memory.Tidal.MaxBoost)
+	fmt.Printf("  memory.tidal.learning_rate: %.2f\n", cfg.Memory.Tidal.LearningRate)
+	fmt.Printf("  memory.tidal.min_samples: %d\n", cfg.Memory.Tidal.MinSamples)
+	fmt.Printf("  proactive.enabled: %t\n", cfg.Proactive.Enabled)
+	fmt.Printf("  proactive.dry_run: %t\n", proactiveDryRunEnabled(cfg))
+	fmt.Printf("  proactive.confidence_threshold: %.2f\n", cfg.Proactive.ConfidenceThreshold)
+	fmt.Printf("  proactive.horizon_seconds: %d\n", cfg.Proactive.HorizonSeconds)
+	fmt.Printf("  proactive.action_interval_seconds: %d\n", cfg.Proactive.ActionIntervalSecs)
+	fmt.Printf("  proactive.max_actions: %d\n", cfg.Proactive.MaxActions)
+	fmt.Printf("  proactive.action_cooldown_seconds: %d\n", cfg.Proactive.ActionCooldownSecs)
+	fmt.Printf("  proactive.allowed_actions: %s\n", strings.Join(cfg.Proactive.AllowedActions, ","))
+	fmt.Printf("  proactive.kernel_learning_enabled: %t\n", proactiveKernelLearningEnabled(cfg))
+	fmt.Printf("  proactive.kernel_learning_rate: %.2f\n", cfg.Proactive.KernelLearningRate)
+	fmt.Printf("  proactive.kernel_min_samples: %d\n", cfg.Proactive.KernelMinSamples)
+	return nil
+}
+
+func delegateChildAutoApprove(cfg *config.Config) bool {
+	if cfg == nil || cfg.Delegate.Child.AutoApprove == nil {
+		return false
+	}
+	return *cfg.Delegate.Child.AutoApprove
+}
+
+func autonomyWorkerAutoApprove(cfg *config.Config) bool {
+	if cfg == nil || cfg.Autonomy.Worker.AutoApprove == nil {
+		return false
+	}
+	return *cfg.Autonomy.Worker.AutoApprove
+}
+
+// runConfigTimeout prints the effective timeout budget for each runtime layer.
+// Values come from the normalized configuration, so omitted settings show the
+// same defaults that a running Agent would use.
+func runConfigTimeout(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	fmt.Println("LuckyAgent 超时配置（有效值）:")
+	fmt.Printf("  Telegram Gateway Chat:       %ds (%s)  [msg_gateway.telegram.chat_timeout_seconds]\n", cfg.MsgGateway.Telegram.ChatTimeoutSeconds, formatTimeoutDuration(cfg.MsgGateway.Telegram.ChatTimeoutSeconds))
+	fmt.Printf("  Agent Loop:                  %ds (%s)  [agent.timeout_seconds]\n", cfg.Agent.TimeoutSeconds, formatTimeoutDuration(cfg.Agent.TimeoutSeconds))
+	fmt.Printf("  Delegate Task:               %ds (%s)  [delegate.timeout_seconds]\n", cfg.Delegate.TimeoutSeconds, formatTimeoutDuration(cfg.Delegate.TimeoutSeconds))
+	fmt.Printf("  Delegate Child Loop:         %ds (%s)  [delegate.child.timeout_seconds]\n", cfg.Delegate.Child.TimeoutSeconds, formatTimeoutDuration(cfg.Delegate.Child.TimeoutSeconds))
+	fmt.Printf("  Simple Local Inspection:     %ds (%s)  [agent.simple_local_inspection.timeout_seconds]\n", cfg.Agent.SimpleLocalInspection.TimeoutSeconds, formatTimeoutDuration(cfg.Agent.SimpleLocalInspection.TimeoutSeconds))
+	fmt.Printf("  OpenCLI:                     %ds (%s)  [opencli.timeout_seconds]\n", cfg.OpenCLI.TimeoutSeconds, formatTimeoutDuration(cfg.OpenCLI.TimeoutSeconds))
+	fmt.Printf("  Computer Use (total):        %ds (%s)  [tools.computer_use.timeout_seconds]\n", cfg.Tools.ComputerUse.TimeoutSeconds, formatTimeoutDuration(cfg.Tools.ComputerUse.TimeoutSeconds))
+	fmt.Printf("  Computer Use (step):         %ds (%s)  [tools.computer_use.step_timeout_seconds]\n", cfg.Tools.ComputerUse.StepTimeoutSeconds, formatTimeoutDuration(cfg.Tools.ComputerUse.StepTimeoutSeconds))
+	fmt.Printf("  Circuit Breaker:              %ds (%s)  [circuit_breaker.timeout_seconds]\n", cfg.CircuitBreaker.TimeoutSeconds, formatTimeoutDuration(cfg.CircuitBreaker.TimeoutSeconds))
+	fmt.Printf("  Autonomy Worker:              %ds (%s)  [autonomy.worker.timeout_seconds]\n", cfg.Autonomy.Worker.TimeoutSeconds, formatTimeoutDuration(cfg.Autonomy.Worker.TimeoutSeconds))
+	fmt.Printf("  Hooks:                        %ds (%s)  [hooks.timeout_seconds]\n", cfg.Hooks.TimeoutSeconds, formatTimeoutDuration(cfg.Hooks.TimeoutSeconds))
+	fmt.Printf("  Limits (max):                 %ds (%s)  [limits.max_timeout_seconds]\n", cfg.Limits.MaxTimeoutSeconds, formatTimeoutDuration(cfg.Limits.MaxTimeoutSeconds))
+	return nil
+}
+
+func runDiagTimeout(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	event, err := gateway.ReadTimeoutEvent(mgr.HomeDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("暂无超时诊断记录。")
+			return nil
+		}
+		return err
+	}
+	fmt.Println("最近一次超时诊断:")
+	fmt.Printf("  Timeout Layer: %s\n", event.Layer)
+	fmt.Printf("  Timeout Value: %ds (%s)\n", event.ConfiguredSeconds, formatTimeoutDuration(event.ConfiguredSeconds))
+	fmt.Printf("  Config Path:   %s\n", event.ConfigPath)
+	fmt.Printf("  Error:         %s\n", event.Error)
+	fmt.Printf("  Recorded At:   %s\n", event.UpdatedAt.Local().Format(time.RFC3339))
+	fmt.Printf("  Suggestion:    调整 %s\n", event.ConfigPath)
+	return nil
+}
+
+func formatTimeoutDuration(seconds int) string {
+	if seconds <= 0 {
+		return "未设置"
+	}
+	if seconds%3600 == 0 {
+		return fmt.Sprintf("%dh", seconds/3600)
+	}
+	if seconds%60 == 0 {
+		return fmt.Sprintf("%dm", seconds/60)
+	}
+	return fmt.Sprintf("%ds", seconds)
+}
+
+func runSoulShow(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return err
+	}
+	fmt.Println(a.Soul().SystemPrompt())
+	return nil
+}
+
+func runSoulList(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return err
+	}
+
+	tm := a.TemplateManager()
+	language, _ := cmd.Flags().GetString("language")
+
+	var templates []*soul.Template
+	if language != "" {
+		templates = tm.ListByLanguage(language)
+	} else {
+		templates = tm.ListTemplates()
+	}
+
+	if len(templates) == 0 {
+		fmt.Println("没有可用的 SOUL 模板")
+		return nil
+	}
+
+	fmt.Printf("%-20s %-12s %-8s %s\n", "ID", "名称", "语言", "描述")
+	fmt.Println(strings.Repeat("-", 70))
+	for _, t := range templates {
+		desc := t.Description
+		if len(desc) > 30 {
+			desc = desc[:27] + "..."
+		}
+		fmt.Printf("%-20s %-12s %-8s %s\n", t.ID, t.Name, t.Language, desc)
+	}
+	return nil
+}
+
+func runSoulSwitch(cmd *cobra.Command, args []string) error {
+	templateID := args[0]
+
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return err
+	}
+
+	tm := a.TemplateManager()
+	tmpl, err := tm.GetTemplate(templateID)
+	if err != nil {
+		return fmt.Errorf("模板 %q 不存在: %w", templateID, err)
+	}
+
+	content := tmpl.Render(nil)
+	soulPath := mgr.Get().SoulPath
+	if soulPath != "" {
+		if err := os.WriteFile(soulPath, []byte(content), 0o644); err != nil {
+			return fmt.Errorf("写入 SOUL 文件失败: %w", err)
+		}
+	}
+
+	fmt.Printf("已切换到 SOUL 模板: %s (%s)\n", tmpl.Name, soul.LanguageName(tmpl.Language))
+	return nil
+}
+
+func maskKey(key string) string {
+	if key == "" {
+		return "(未设置)"
+	}
+	if len(key) <= 8 {
+		return "***"
+	}
+	return key[:8] + "..."
+}
+
+func getAgent() (*agent.Agent, error) {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return nil, err
+	}
+	if err := mgr.Load(); err != nil {
+		return nil, err
+	}
+	return appboot.New(mgr)
+}
+
+type msgGatewayStartOptions struct {
+	StartAll           bool
+	Platform           string
+	Token              string
+	QQAppID            string
+	QQAppSecret        string
+	QQSandbox          bool
+	NapCatListenAddr   string
+	NapCatPath         string
+	NapCatAccessToken  string
+	FeishuAppID        string
+	FeishuAppSecret    string
+	FeishuVerifyToken  string
+	FeishuListenAddr   string
+	FeishuPath         string
+	WeixinToken        string
+	WeixinAcct         string
+	OpenClawWeixinAcct string
+}
+
+type weixinLoginOptions struct {
+	Driver       string
+	BaseURL      string
+	PollInterval time.Duration
+	Timeout      time.Duration
+	NoSave       bool
+	PrintStatus  bool
+}
+
+func resolveMsgGatewayStartOptions(cmd *cobra.Command, cfg *config.Config) msgGatewayStartOptions {
+	opts := msgGatewayStartOptions{}
+	if cmd == nil {
+		return opts
+	}
+
+	opts.StartAll, _ = cmd.Flags().GetBool("all")
+	if !cmd.Flags().Changed("all") && cfg != nil {
+		opts.StartAll = cfg.MsgGateway.StartAll
+	}
+
+	opts.Platform, _ = cmd.Flags().GetString("platform")
+	if !cmd.Flags().Changed("platform") && cfg != nil && cfg.MsgGateway.Platform != "" {
+		opts.Platform = cfg.MsgGateway.Platform
+	}
+	opts.Platform = normalizeMsgGatewayPlatform(opts.Platform)
+
+	opts.Token, _ = cmd.Flags().GetString("token")
+	if !cmd.Flags().Changed("token") && cfg != nil {
+		if cfg.MsgGateway.Telegram.Token != "" {
+			opts.Token = cfg.MsgGateway.Telegram.Token
+		}
+	}
+
+	opts.QQAppID, _ = cmd.Flags().GetString("qq-appid")
+	if !cmd.Flags().Changed("qq-appid") && cfg != nil {
+		opts.QQAppID = cfg.MsgGateway.QQOfficial.AppID
+	}
+
+	opts.QQAppSecret, _ = cmd.Flags().GetString("qq-appsecret")
+	if !cmd.Flags().Changed("qq-appsecret") && cfg != nil {
+		opts.QQAppSecret = cfg.MsgGateway.QQOfficial.AppSecret
+	}
+
+	opts.QQSandbox, _ = cmd.Flags().GetBool("qq-sandbox")
+	if !cmd.Flags().Changed("qq-sandbox") && cfg != nil {
+		opts.QQSandbox = cfg.MsgGateway.QQOfficial.Sandbox
+	}
+
+	opts.NapCatListenAddr, _ = cmd.Flags().GetString("napcat-listen")
+	if !cmd.Flags().Changed("napcat-listen") && cfg != nil {
+		opts.NapCatListenAddr = cfg.MsgGateway.NapCat.ListenAddr
+	}
+	opts.NapCatPath, _ = cmd.Flags().GetString("napcat-path")
+	if !cmd.Flags().Changed("napcat-path") && cfg != nil {
+		opts.NapCatPath = cfg.MsgGateway.NapCat.Path
+	}
+	opts.NapCatAccessToken, _ = cmd.Flags().GetString("napcat-access-token")
+	if !cmd.Flags().Changed("napcat-access-token") && cfg != nil {
+		opts.NapCatAccessToken = cfg.MsgGateway.NapCat.AccessToken
+	}
+
+	opts.FeishuAppID, _ = cmd.Flags().GetString("feishu-app-id")
+	if !cmd.Flags().Changed("feishu-app-id") && cfg != nil {
+		opts.FeishuAppID = cfg.MsgGateway.Feishu.AppID
+	}
+	opts.FeishuAppSecret, _ = cmd.Flags().GetString("feishu-app-secret")
+	if !cmd.Flags().Changed("feishu-app-secret") && cfg != nil {
+		opts.FeishuAppSecret = cfg.MsgGateway.Feishu.AppSecret
+	}
+	opts.FeishuVerifyToken, _ = cmd.Flags().GetString("feishu-verification-token")
+	if !cmd.Flags().Changed("feishu-verification-token") && cfg != nil {
+		opts.FeishuVerifyToken = cfg.MsgGateway.Feishu.VerificationToken
+	}
+	opts.FeishuListenAddr, _ = cmd.Flags().GetString("feishu-listen")
+	if !cmd.Flags().Changed("feishu-listen") && cfg != nil {
+		opts.FeishuListenAddr = cfg.MsgGateway.Feishu.ListenAddr
+	}
+	opts.FeishuPath, _ = cmd.Flags().GetString("feishu-path")
+	if !cmd.Flags().Changed("feishu-path") && cfg != nil {
+		opts.FeishuPath = cfg.MsgGateway.Feishu.Path
+	}
+
+	if cfg != nil {
+		opts.WeixinToken = strings.TrimSpace(cfg.MsgGateway.Weixin.Token)
+		opts.WeixinAcct = strings.TrimSpace(cfg.MsgGateway.Weixin.AccountID)
+		opts.OpenClawWeixinAcct = strings.TrimSpace(cfg.MsgGateway.OpenClawWeixin.AccountID)
+	}
+
+	return opts
+}
+
+func normalizeMsgGatewayPlatform(platform string) string {
+	switch strings.ToLower(strings.TrimSpace(platform)) {
+	case "tg", "telegram":
+		return "telegram"
+	case "qq", "qqo", "qqofficial", "official":
+		return "qqofficial"
+	case "nap", "napcat", "onebot":
+		return "napcat"
+	case "fs", "feishu", "lark":
+		return "feishu"
+	case "wx", "weixin", "ilink":
+		return "weixin"
+	case "ocwx", "openclaw", "openclawweixin":
+		return "openclawweixin"
+	default:
+		return strings.TrimSpace(platform)
+	}
+}
+
+func validateMsgGatewayStartOptions(opts msgGatewayStartOptions) error {
+	if opts.StartAll {
+		return nil
+	}
+
+	if opts.Platform == "weixin" {
+		if strings.TrimSpace(opts.WeixinToken) == "" || strings.TrimSpace(opts.WeixinAcct) == "" {
+			return fmt.Errorf("weixin 需要 msg_gateway.weixin.token 和 msg_gateway.weixin.account_id")
+		}
+		return nil
+	}
+	if opts.Platform == "openclawweixin" {
+		if strings.TrimSpace(opts.OpenClawWeixinAcct) == "" {
+			return fmt.Errorf("openclawweixin 需要 msg_gateway.openclawweixin.account_id")
+		}
+		return nil
+	}
+
+	switch opts.Platform {
+	case "telegram":
+		if strings.TrimSpace(opts.Token) == "" {
+			return fmt.Errorf("telegram 需要 --token 参数（或在 config.json 里设置 msg_gateway.telegram.token）")
+		}
+	case "qqofficial":
+		if strings.TrimSpace(opts.QQAppID) == "" || strings.TrimSpace(opts.QQAppSecret) == "" {
+			return fmt.Errorf("qqofficial 需要 --qq-appid 和 --qq-appsecret（或在 config.json 里设置 msg_gateway.qqofficial.app_id / app_secret）")
+		}
+	case "napcat":
+		return nil
+	case "feishu":
+		if strings.TrimSpace(opts.FeishuAppID) == "" || strings.TrimSpace(opts.FeishuAppSecret) == "" {
+			return fmt.Errorf("feishu 需要 app_id 和 app_secret（可通过 --feishu-app-id、--feishu-app-secret 或 msg_gateway.feishu.* 配置）")
+		}
+	default:
+		if opts.Platform == "" {
+			return fmt.Errorf("请通过 --platform 指定平台，或在 config.json 设置 msg_gateway.platform")
+		}
+		return fmt.Errorf("不支持的平台: %s (支持: telegram, qqofficial, napcat, feishu, weixin, openclawweixin)", opts.Platform)
+	}
+
+	return nil
+}
+
+func runMsgGatewayWeixinLogin(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	if err := mgr.InitHome(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+
+	opts := weixinLoginOptions{
+		Driver:       "ilink",
+		BaseURL:      strings.TrimSpace(cfg.MsgGateway.Weixin.BaseURL),
+		PollInterval: 2 * time.Second,
+		Timeout:      3 * time.Minute,
+	}
+	if v, _ := cmd.Flags().GetString("driver"); strings.TrimSpace(v) != "" {
+		opts.Driver = strings.ToLower(strings.TrimSpace(v))
+	}
+	if v, _ := cmd.Flags().GetString("base-url"); strings.TrimSpace(v) != "" {
+		opts.BaseURL = strings.TrimSpace(v)
+	}
+	if v, _ := cmd.Flags().GetDuration("poll-interval"); v > 0 {
+		opts.PollInterval = v
+	}
+	if v, _ := cmd.Flags().GetDuration("timeout"); v > 0 {
+		opts.Timeout = v
+	}
+	opts.NoSave, _ = cmd.Flags().GetBool("no-save")
+	opts.PrintStatus, _ = cmd.Flags().GetBool("print-status")
+
+	if opts.BaseURL == "" {
+		opts.BaseURL = "https://ilinkai.weixin.qq.com"
+	}
+	if opts.Driver == "" {
+		opts.Driver = "ilink"
+	}
+	if opts.Driver == "openclaw" {
+		return runMsgGatewayWeixinLoginWithOpenClaw(opts)
+	}
+	if opts.Driver != "ilink" {
+		return fmt.Errorf("unsupported weixin login driver: %s (supported: ilink, openclaw)", opts.Driver)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), opts.Timeout)
+	defer cancel()
+
+	client := weixin.NewLoginClient(opts.BaseURL)
+	login, err := client.FetchQRCode(ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("微信登录二维码已生成。")
+	if login.QRCodeURL != "" {
+		fmt.Printf("请打开扫码链接：%s\n", login.QRCodeURL)
+	}
+	if login.QRCode != "" && login.QRCodeURL != login.QRCode {
+		fmt.Printf("二维码票据：%s\n", login.QRCode)
+	}
+	if len(login.RawImage) > 0 {
+		qrPath := filepath.Join(mgr.HomeDir(), "runtime", "weixin-login-qrcode.png")
+		if err := os.WriteFile(qrPath, login.RawImage, 0o600); err == nil {
+			fmt.Printf("二维码图片已保存：%s\n", qrPath)
+		}
+	}
+	fmt.Println("请在手机微信中完成扫码并确认登录。")
+
+	if opts.PrintStatus {
+		fmt.Println("开始轮询二维码状态...")
+	}
+
+	result, err := pollWeixinLogin(ctx, client, login.QRCode, opts.PollInterval, opts.PrintStatus)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("微信登录成功。")
+	fmt.Printf("account_id: %s\n", result.AccountID)
+	fmt.Printf("base_url: %s\n", result.BaseURL)
+
+	if opts.NoSave {
+		fmt.Printf("token: %s\n", result.Token)
+		return nil
+	}
+
+	if err := mgr.Set("msg_gateway.weixin.token", result.Token); err != nil {
+		return err
+	}
+	if err := mgr.Set("msg_gateway.weixin.account_id", result.AccountID); err != nil {
+		return err
+	}
+	if strings.TrimSpace(result.BaseURL) != "" {
+		if err := mgr.Set("msg_gateway.weixin.base_url", result.BaseURL); err != nil {
+			return err
+		}
+	}
+	if err := mgr.Save(); err != nil {
+		return err
+	}
+
+	fmt.Printf("已写入配置：%s\n", filepath.Join(mgr.HomeDir(), "config.json"))
+	return nil
+}
+
+func runMsgGatewayWeixinLoginWithOpenClaw(opts weixinLoginOptions) error {
+	_ = opts
+	fmt.Println("Using OpenClaw Weixin installer for QR login.")
+	fmt.Println("This flow installs the OpenClaw Weixin plugin, performs QR login, and restarts OpenClaw Gateway.")
+	fmt.Println("LuckyAgent built-in weixin gateway still uses iLink token/account_id mode.")
+
+	cmd := exec.Command("npx", "-y", "@tencent-weixin/openclaw-weixin-cli@latest", "install")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+func pollWeixinLogin(ctx context.Context, client *weixin.LoginClient, qrCode string, interval time.Duration, printStatus bool) (*weixin.QRCodeLogin, error) {
+	if client == nil {
+		return nil, fmt.Errorf("weixin login: client is nil")
+	}
+	return pollWeixinLoginWithFetcher(ctx, client.GetQRCodeStatus, qrCode, interval, printStatus)
+}
+
+func pollWeixinLoginWithFetcher(ctx context.Context, fetch func(context.Context, string) (*weixin.QRCodeLogin, error), qrCode string, interval time.Duration, printStatus bool) (*weixin.QRCodeLogin, error) {
+	if fetch == nil {
+		return nil, fmt.Errorf("weixin login: fetcher is nil")
+	}
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	const maxTransientFailures = 5
+	seen := ""
+	transientFailures := 0
+	for {
+		login, err := fetch(ctx, qrCode)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if isTerminalWeixinLoginError(err) {
+				return nil, err
+			}
+			transientFailures++
+			if transientFailures >= maxTransientFailures {
+				return nil, fmt.Errorf("weixin login: qrcode status request failed %d times: %w", transientFailures, err)
+			}
+			delay := weixinLoginRetryDelay(interval, transientFailures)
+			if printStatus {
+				fmt.Printf("二维码状态请求失败，将在 %s 后重试（%d/%d）：%v\n", delay, transientFailures, maxTransientFailures, err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+		transientFailures = 0
+		if login == nil {
+			return nil, fmt.Errorf("weixin login: empty qrcode status response")
+		}
+
+		status := strings.TrimSpace(login.Status)
+		if printStatus && status != "" && status != seen {
+			seen = status
+			if strings.TrimSpace(login.Description) != "" {
+				fmt.Printf("状态：%s (%s)\n", status, strings.TrimSpace(login.Description))
+			} else {
+				fmt.Printf("状态：%s\n", status)
+			}
+		}
+
+		switch {
+		case isWeixinLoginSuccessStatus(status):
+			if strings.TrimSpace(login.Token) == "" || strings.TrimSpace(login.AccountID) == "" {
+				return nil, fmt.Errorf("weixin login: login succeeded but token/account_id missing")
+			}
+			return login, nil
+		case isWeixinLoginFailureStatus(status):
+			msg := strings.TrimSpace(login.Description)
+			if msg == "" {
+				msg = status
+			}
+			return nil, fmt.Errorf("weixin login: %s", msg)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+}
+
+func weixinLoginRetryDelay(interval time.Duration, failures int) time.Duration {
+	delay := interval
+	for attempt := 1; attempt < failures && delay < 15*time.Second; attempt++ {
+		delay *= 2
+	}
+	if delay > 15*time.Second {
+		return 15 * time.Second
+	}
+	return delay
+}
+
+func isTerminalWeixinLoginError(err error) bool {
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"expired", "cancelled", "canceled", "denied", "rejected", "invalid qrcode", "invalid qr code"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isWeixinLoginSuccessStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "confirmed", "confirm", "success", "ok", "logged_in", "login_success":
+		return true
+	default:
+		return false
+	}
+}
+
+func isWeixinLoginFailureStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "expired", "cancelled", "canceled", "failed", "denied", "rejected":
+		return true
+	default:
+		return false
+	}
+}
+
+func runServe(cmd *cobra.Command, args []string) error {
+	a, err := getAgent()
+	if err != nil {
+		return err
+	}
+	stopWatch, _ := a.StartConfigWatch(5 * time.Second)
+	defer stopWatch()
+
+	cfg := server.DefaultServerConfig()
+	runtimeCfg := a.Config().Get().Server
+	if runtimeCfg.Addr != "" {
+		cfg.Addr = runtimeCfg.Addr
+	}
+	if len(runtimeCfg.APIKeys) > 0 {
+		cfg.APIKeys = append([]string(nil), runtimeCfg.APIKeys...)
+	}
+	cfg.EnableCORS = runtimeCfg.EnableCORS
+	if len(runtimeCfg.CORSOrigins) > 0 {
+		cfg.CORSOrigins = append([]string(nil), runtimeCfg.CORSOrigins...)
+	}
+	if runtimeCfg.RateLimit > 0 {
+		cfg.RateLimit = runtimeCfg.RateLimit
+	}
+	if runtimeCfg.MetricsAddr != "" {
+		cfg.MetricsAddr = runtimeCfg.MetricsAddr
+	}
+	if runtimeCfg.LogLevel != "" {
+		cfg.LogLevel = runtimeCfg.LogLevel
+	}
+	if runtimeCfg.LogFormat != "" {
+		cfg.LogFormat = runtimeCfg.LogFormat
+	}
+
+	if cmd.Flags().Changed("addr") {
+		addr, _ := cmd.Flags().GetString("addr")
+		if addr != "" {
+			cfg.Addr = addr
+		}
+	}
+
+	s := server.New(a, cfg)
+	if err := s.Start(); err != nil {
+		return err
+	}
+
+	return waitForServeStop(s)
+}
+
+func runMsgGatewayStart(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	opts := resolveMsgGatewayStartOptions(cmd, cfg)
+	if err := validateMsgGatewayStartOptions(opts); err != nil {
+		return err
+	}
+	if strings.TrimSpace(opts.Platform) != "" {
+		if err := mgr.Set("msg_gateway.platform", strings.TrimSpace(opts.Platform)); err != nil {
+			return err
+		}
+	}
+
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return err
+	}
+	stopWatch, _ := a.StartConfigWatch(5 * time.Second)
+	defer stopWatch()
+
+	gm := a.MsgGateway()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	homeDir := a.Config().HomeDir()
+	if opts.Platform == "telegram" {
+		releaseTelegramLease, err := gateway.AcquireTelegramGatewayLease(homeDir)
+		if err != nil {
+			return err
+		}
+		defer releaseTelegramLease()
+	}
+	syncTelegramState := func(registered, connected bool) {
+		stats, _ := gm.Stats("telegram")
+		_ = gateway.WriteSharedTelegramState(homeDir, gateway.SharedTelegramState{
+			PID:              os.Getpid(),
+			Registered:       registered,
+			Connected:        connected,
+			MessagesSent:     stats.MessagesSent,
+			MessagesReceived: stats.MessagesReceived,
+			Errors:           stats.Errors,
+		})
+	}
+
+	if opts.StartAll {
+		if err := gm.StartAll(ctx); err != nil {
+			return err
+		}
+		fmt.Println("所有消息网关已启动")
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		if err := stopGatewaysWithTimeout(gm.StopAll, msgGatewayShutdownTimeout); err != nil {
+			fmt.Fprintln(os.Stderr, "warning:", err)
+		}
+		return nil
+	}
+
+	switch opts.Platform {
+	case "telegram":
+		tgAdapter := telegram.NewAdapter(telegram.Config{
+			Token:               opts.Token,
+			Proxy:               cfg.MsgGateway.Telegram.Proxy,
+			AllowedChats:        append([]string(nil), cfg.MsgGateway.Telegram.AllowedChats...),
+			AdminIDs:            append([]string(nil), cfg.MsgGateway.Telegram.AdminIDs...),
+			DisableAutoReaction: cfg.MsgGateway.Telegram.DisableAutoReaction,
+		})
+		handler := telegram.NewHandlerWithRuntime(tgAdapter, telegram.NewRuntime(a))
+		handler.SetDataDir(filepath.Join(a.Config().HomeDir(), "data", "telegram"))
+		tgAdapter.SetHandler(func(ctx context.Context, msg *gateway.Message) error {
+			return handler.HandleMessage(ctx, msg)
+		})
+		if err := gm.Register(tgAdapter); err != nil {
+			return err
+		}
+		syncTelegramState(true, false)
+		if err := gm.Start(ctx, "telegram"); err != nil {
+			syncTelegramState(false, false)
+			return err
+		}
+		syncTelegramState(true, true)
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if gw, ok := gm.Get("telegram"); ok {
+						syncTelegramState(true, gw.IsRunning())
+					} else {
+						syncTelegramState(false, false)
+					}
+				}
+			}
+		}()
+		fmt.Println("Telegram 网关已启动")
+	case "qqofficial":
+		qqAdapter := qqofficial.NewAdapter(qqofficial.Config{
+			AppID:         opts.QQAppID,
+			AppSecret:     opts.QQAppSecret,
+			Proxy:         cfg.MsgGateway.QQOfficial.Proxy,
+			Sandbox:       opts.QQSandbox,
+			APIBaseURL:    cfg.MsgGateway.QQOfficial.APIBaseURL,
+			GatewayURL:    cfg.MsgGateway.QQOfficial.GatewayURL,
+			LogPath:       filepath.Join(a.Config().HomeDir(), "logs", "qqofficial-gateway.log"),
+			AllowedChats:  append([]string(nil), cfg.MsgGateway.QQOfficial.AllowedChats...),
+			AllowedUsers:  append([]string(nil), cfg.MsgGateway.QQOfficial.AllowedUsers...),
+			RemoveAt:      cfg.MsgGateway.QQOfficial.RemoveAt,
+			HeartbeatSec:  cfg.MsgGateway.QQOfficial.HeartbeatSec,
+			ReconnectWait: cfg.MsgGateway.QQOfficial.ReconnectWait,
+			Intents:       append([]string(nil), cfg.MsgGateway.QQOfficial.Intents...),
+		})
+		handler := qqofficial.NewHandler(qqAdapter, a)
+		handler.SetDataDir(filepath.Join(a.Config().HomeDir(), "data", "qqofficial"))
+		qqAdapter.SetHandler(func(ctx context.Context, msg *gateway.Message) error {
+			return handler.HandleMessage(ctx, msg)
+		})
+		if err := gm.Register(qqAdapter); err != nil {
+			return err
+		}
+		if err := gm.Start(ctx, "qqofficial"); err != nil {
+			return err
+		}
+		fmt.Println("QQ 官方机器人网关已启动")
+	case "napcat":
+		napcatAdapter := napcat.NewAdapter(napcat.Config{
+			ListenAddr:       opts.NapCatListenAddr,
+			Path:             opts.NapCatPath,
+			AccessToken:      opts.NapCatAccessToken,
+			AllowedChats:     append([]string(nil), cfg.MsgGateway.NapCat.AllowedChats...),
+			AllowedUsers:     append([]string(nil), cfg.MsgGateway.NapCat.AllowedUsers...),
+			RemoveAt:         cfg.MsgGateway.NapCat.RemoveAt,
+			GroupTriggerMode: cfg.MsgGateway.NapCat.GroupTriggerMode,
+		})
+		if cfg.MsgGateway.NapCat.CrossGroupRead.Enabled {
+			a.Tools().Register(tool.NapCatReadGroupTool(napcatAdapter, tool.NapCatCrossGroupReadConfig{
+				Enabled:             true,
+				RequireConfirmation: cfg.MsgGateway.NapCat.CrossGroupRead.RequireConfirmation,
+				AllowedGroups:       append([]string(nil), cfg.MsgGateway.NapCat.CrossGroupRead.AllowedGroups...),
+				BlockedGroups:       append([]string(nil), cfg.MsgGateway.NapCat.CrossGroupRead.BlockedGroups...),
+				LogAccess:           cfg.MsgGateway.NapCat.CrossGroupRead.LogAccess,
+			}))
+		}
+		handler := qqofficial.NewHandlerWithOptions(napcatAdapter, a, qqofficial.HandlerOptions{
+			PlatformName:    "napcat",
+			DisplayName:     "NapCat QQ 网关",
+			LogPrefix:       "napcat",
+			FinalAnswerOnly: true,
+		})
+		handler.SetDataDir(filepath.Join(a.Config().HomeDir(), "data", "napcat"))
+		napcatAdapter.SetHandler(func(ctx context.Context, msg *gateway.Message) error {
+			return handler.HandleMessage(ctx, msg)
+		})
+		if err := gm.Register(napcatAdapter); err != nil {
+			return err
+		}
+		if err := gm.Start(ctx, "napcat"); err != nil {
+			return err
+		}
+		napcatPath := strings.TrimSpace(opts.NapCatPath)
+		if napcatPath == "" {
+			napcatPath = cfg.MsgGateway.NapCat.Path
+		}
+		if strings.TrimSpace(napcatPath) == "" {
+			napcatPath = "/onebot/v11/ws"
+		}
+		if !strings.HasPrefix(napcatPath, "/") {
+			napcatPath = "/" + napcatPath
+		}
+		fmt.Printf("NapCat QQ 网关已启动，等待 NapCat 连接 ws://%s%s\n", napcatAdapter.ListenAddr(), napcatPath)
+	case "feishu":
+		feishuAdapter := feishu.NewAdapter(feishu.Config{
+			AppID:             opts.FeishuAppID,
+			AppSecret:         opts.FeishuAppSecret,
+			VerificationToken: opts.FeishuVerifyToken,
+			EncryptKey:        cfg.MsgGateway.Feishu.EncryptKey,
+			RenderMode:        cfg.MsgGateway.Feishu.RenderMode,
+			MediaEnabled:      cfg.MsgGateway.Feishu.MediaEnabled,
+			MaxMediaBytes:     cfg.MsgGateway.Feishu.MaxMediaBytes,
+			CardProgress:      cfg.MsgGateway.Feishu.CardProgress,
+			ListenAddr:        opts.FeishuListenAddr,
+			Path:              opts.FeishuPath,
+			APIBaseURL:        cfg.MsgGateway.Feishu.APIBaseURL,
+			AllowedChats:      append([]string(nil), cfg.MsgGateway.Feishu.AllowedChats...),
+			AllowedUsers:      append([]string(nil), cfg.MsgGateway.Feishu.AllowedUsers...),
+			RemoveAt:          cfg.MsgGateway.Feishu.RemoveAt,
+			GroupTriggerMode:  cfg.MsgGateway.Feishu.GroupTriggerMode,
+			DataDir:           filepath.Join(a.Config().HomeDir(), "data", "feishu"),
+		})
+		handler := qqofficial.NewHandlerWithOptions(feishuAdapter, a, qqofficial.HandlerOptions{
+			PlatformName:    "feishu",
+			DisplayName:     "飞书网关",
+			LogPrefix:       "feishu",
+			FinalAnswerOnly: true,
+			DeliveryGuidance: func(input string) string {
+				return feishu.MediaDeliveryGuidance(input, cfg.MsgGateway.Feishu.MediaEnabled)
+			},
+		})
+		handler.SetDataDir(filepath.Join(a.Config().HomeDir(), "data", "feishu"))
+		feishuAdapter.SetHandler(func(ctx context.Context, msg *gateway.Message) error {
+			return handler.HandleMessage(ctx, msg)
+		})
+		if err := gm.Register(feishuAdapter); err != nil {
+			return err
+		}
+		if err := gm.Start(ctx, "feishu"); err != nil {
+			return err
+		}
+		if feishuAdapter.UsesLongConnection() {
+			fmt.Println("飞书网关已启动，使用官方长连接接收事件，无需公网回调地址或 Verification Token。")
+		} else {
+			fmt.Printf("飞书网关已启动，本地事件回调 http://%s%s（飞书控制台需配置公网 HTTPS 反向代理地址）\n", feishuAdapter.ListenAddr(), feishuAdapter.Path())
+		}
+	case "weixin":
+		wxAdapter := weixin.NewAdapter(weixin.Config{
+			Token:                   cfg.MsgGateway.Weixin.Token,
+			AccountID:               cfg.MsgGateway.Weixin.AccountID,
+			BaseURL:                 cfg.MsgGateway.Weixin.BaseURL,
+			DMPolicy:                cfg.MsgGateway.Weixin.DMPolicy,
+			GroupPolicy:             cfg.MsgGateway.Weixin.GroupPolicy,
+			AllowedUsers:            append([]string(nil), cfg.MsgGateway.Weixin.AllowedUsers...),
+			GroupAllowedUsers:       append([]string(nil), cfg.MsgGateway.Weixin.GroupAllowedUsers...),
+			SplitMultilineMessages:  cfg.MsgGateway.Weixin.SplitMultilineMessages,
+			PollTimeoutMilliseconds: cfg.MsgGateway.Weixin.PollTimeoutMilliseconds,
+			SendChunkDelayMS:        cfg.MsgGateway.Weixin.SendChunkDelayMS,
+		})
+		wxLucky := luckycollector.NewLucky()
+		wxAdapter.SetHandler(func(ctx context.Context, msg *gateway.Message) error {
+			return handlePlainGatewayMessageWithLucky(ctx, "weixin", a, wxAdapter, wxLucky, msg, "处理消息失败")
+		})
+		if err := gm.Register(wxAdapter); err != nil {
+			return err
+		}
+		if err := gm.Start(ctx, "weixin"); err != nil {
+			return err
+		}
+		fmt.Println("Weixin 鄂大・蟾ｲ蜷ｯ蜉ｨ")
+	case "openclawweixin":
+		wxAdapter := openclawweixin.NewAdapter(openclawweixin.Config{
+			AccountID:               cfg.MsgGateway.OpenClawWeixin.AccountID,
+			StateDir:                cfg.MsgGateway.OpenClawWeixin.StateDir,
+			DMPolicy:                cfg.MsgGateway.OpenClawWeixin.DMPolicy,
+			GroupPolicy:             cfg.MsgGateway.OpenClawWeixin.GroupPolicy,
+			AllowedUsers:            append([]string(nil), cfg.MsgGateway.OpenClawWeixin.AllowedUsers...),
+			GroupAllowedUsers:       append([]string(nil), cfg.MsgGateway.OpenClawWeixin.GroupAllowedUsers...),
+			SplitMultilineMessages:  cfg.MsgGateway.OpenClawWeixin.SplitMultilineMessages,
+			PollTimeoutMilliseconds: cfg.MsgGateway.OpenClawWeixin.PollTimeoutMilliseconds,
+			SendChunkDelayMS:        cfg.MsgGateway.OpenClawWeixin.SendChunkDelayMS,
+		})
+		wxLucky := luckycollector.NewLucky()
+		wxAdapter.SetHandler(func(ctx context.Context, msg *gateway.Message) error {
+			return handlePlainGatewayMessageWithLucky(ctx, "openclawweixin", a, wxAdapter, wxLucky, msg, "openclawweixin gateway error")
+		})
+		if err := gm.Register(wxAdapter); err != nil {
+			return err
+		}
+		if err := gm.Start(ctx, "openclawweixin"); err != nil {
+			return err
+		}
+		fmt.Println("OpenClaw Weixin gateway started")
+	default:
+		return validateMsgGatewayStartOptions(opts)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	if err := stopGatewaysWithTimeout(gm.StopAll, msgGatewayShutdownTimeout); err != nil {
+		fmt.Fprintln(os.Stderr, "warning:", err)
+	}
+	syncTelegramState(false, false)
+	return nil
+}
+
+// stopGatewaysWithTimeout bounds process shutdown after SIGINT or SIGTERM.
+// Gateway adapters should stop promptly after their contexts are canceled, but
+// a broken proxy or an uncooperative upstream must not keep the CLI PID alive
+// indefinitely. Returning from the command ends the process and its remaining
+// goroutines, while normal adapter restarts still use GatewayManager.StopAll
+// directly and retain its full graceful-wait behavior.
+func stopGatewaysWithTimeout(stop func() error, timeout time.Duration) error {
+	if stop == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = msgGatewayShutdownTimeout
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- stop()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("message gateway shutdown exceeded %s; exiting process", timeout)
+	}
+}
+
+func handlePlainGatewayMessageWithLucky(ctx context.Context, platform string, runtime *agent.Agent, gw gateway.Gateway, lucky *luckycollector.Lucky, msg *gateway.Message, errorPrefix string) error {
+	if msg == nil || runtime == nil || gw == nil {
+		return nil
+	}
+	platform = strings.TrimSpace(platform)
+	if platform == "" {
+		platform = gw.Name()
+	}
+	if lucky == nil {
+		lucky = luckycollector.NewLucky()
+	}
+	if msg.IsCommand && strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(msg.Command), "/"), "lucky") {
+		return handlePlainGatewayLuckyCommand(ctx, platform, runtime, gw, lucky, msg, errorPrefix)
+	}
+
+	key := luckycollector.KeyForMessage(platform, msg)
+	status := lucky.Status(key)
+	if status.Active {
+		status, err := lucky.Append(key, msg)
+		if err != nil {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "Lucky collection failed: "+err.Error())
+		}
+		return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, fmt.Sprintf("已收集第 %d 段（附件 %d 个）。发送 /lucky off 提交，/lucky cancel 放弃。", status.SegmentCount, status.AttachmentCount))
+	}
+
+	text := strings.TrimSpace(msg.Text)
+	if text == "" && len(msg.Attachments) == 0 {
+		return nil
+	}
+	input := agent.MultimodalUserTurnInput(text, msg.Attachments)
+	return sendPlainGatewayAgentInput(ctx, platform, runtime, gw, msg, input, errorPrefix)
+}
+
+func handlePlainGatewayLuckyCommand(ctx context.Context, platform string, runtime *agent.Agent, gw gateway.Gateway, lucky *luckycollector.Lucky, msg *gateway.Message, errorPrefix string) error {
+	action := luckycollector.ParseLuckyAction(msg.Args)
+	key := luckycollector.KeyForMessage(platform, msg)
+
+	switch action {
+	case luckycollector.LuckyActionOn:
+		status, err := lucky.Start(key)
+		if errors.Is(err, luckycollector.ErrAlreadyActive) {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, fmt.Sprintf("Lucky 已经在收集中：当前 %d 段，附件 %d 个。发送 /lucky off 提交，/lucky cancel 放弃。", status.SegmentCount, status.AttachmentCount))
+		}
+		if err != nil {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "Lucky 开启失败："+err.Error())
+		}
+		return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "Lucky 已开启。接下来发送的多段消息会先被收集；发送 /lucky off 后再统一交给 agent。")
+	case luckycollector.LuckyActionOff:
+		batch, err := lucky.Finish(key)
+		if errors.Is(err, luckycollector.ErrInactive) {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "当前没有正在进行的 Lucky 收集。发送 /lucky on 开始。")
+		}
+		if errors.Is(err, luckycollector.ErrEmptyBatch) {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "没有收集到消息，已退出 Lucky 收集模式。")
+		}
+		if err != nil {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "Lucky 提交失败："+err.Error())
+		}
+		return sendPlainGatewayAgentInput(ctx, platform, runtime, gw, msg, agent.UserTurnInputFromTurn(batch.UserTurnInput()), errorPrefix)
+	case luckycollector.LuckyActionStatus:
+		status := lucky.Status(key)
+		if !status.Active {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "Lucky 未开启。发送 /lucky on 开始收集多段消息。")
+		}
+		return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, fmt.Sprintf("Lucky 正在收集：%d 段，附件 %d 个。发送 /lucky off 提交，/lucky cancel 放弃。", status.SegmentCount, status.AttachmentCount))
+	case luckycollector.LuckyActionCancel:
+		status, ok := lucky.Cancel(key)
+		if !ok {
+			return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "当前没有正在进行的 Lucky 收集。")
+		}
+		return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, fmt.Sprintf("已取消 Lucky 收集，丢弃 %d 段消息和 %d 个附件。", status.SegmentCount, status.AttachmentCount))
+	default:
+		return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, "用法：/lucky on | /lucky off | /lucky status | /lucky cancel")
+	}
+}
+
+func sendPlainGatewayAgentInput(ctx context.Context, platform string, runtime *agent.Agent, gw gateway.Gateway, msg *gateway.Message, input agent.UserTurnInput, errorPrefix string) error {
+	sessionID := platform + ":" + msg.Chat.ID
+	if sessions := runtime.Sessions(); sessions != nil {
+		sessions.Ensure(sessionID)
+	}
+	reply, err := runtime.ChatWithSessionInput(ctx, sessionID, input)
+	if err != nil {
+		prefix := strings.TrimSpace(errorPrefix)
+		if prefix == "" {
+			prefix = "处理消息失败"
+		}
+		return gw.Send(ctx, msg.Chat.ID, prefix+": "+err.Error())
+	}
+	return gw.SendWithReply(ctx, msg.Chat.ID, msg.ID, reply)
+}
+
+func runRAGIndex(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return fmt.Errorf("create agent: %w", err)
+	}
+
+	ragMgr := a.RAG()
+	path := args[0]
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("path not found: %w", err)
+	}
+
+	if info.IsDir() {
+		docs, err := ragMgr.IndexDirectory(path)
+		if err != nil {
+			return fmt.Errorf("index directory: %w", err)
+		}
+		fmt.Printf("Indexed %d documents\n", len(docs))
+		for _, d := range docs {
+			fmt.Printf("  %s (%d chunks)\n", d.Title, len(d.Chunks))
+		}
+		return nil
+	}
+
+	doc, err := ragMgr.IndexFile(path)
+	if err != nil {
+		return fmt.Errorf("index file: %w", err)
+	}
+	fmt.Printf("Indexed: %s (%d chunks)\n", doc.Title, len(doc.Chunks))
+	return nil
+}
+
+func runRAGSearch(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return fmt.Errorf("create agent: %w", err)
+	}
+
+	results, err := a.RAG().Search(context.Background(), args[0])
+	if err != nil {
+		return fmt.Errorf("search: %w", err)
+	}
+	if len(results) == 0 {
+		fmt.Println("No results found")
+		return nil
+	}
+
+	fmt.Printf("Found %d results:\n", len(results))
+	for i, r := range results {
+		title := r.DocTitle
+		if title == "" {
+			if r.DocSource != "" {
+				title = r.DocSource
+			} else if src := r.Metadata["source"]; src != "" {
+				title = src
+			} else {
+				title = "(unknown source)"
+			}
+		}
+		content := r.Content
+		if content == "" {
+			content = "(no chunk content cached, chunk_id=" + r.ChunkID + ")"
+		}
+		if len(content) > 120 {
+			content = content[:120] + "..."
+		}
+		fmt.Printf("  %d. [%.2f] %s - %s\n", i+1, r.Score, title, content)
+	}
+	return nil
+}
+
+func runRAGStats(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	a, err := appboot.New(mgr)
+	if err != nil {
+		return fmt.Errorf("create agent: %w", err)
+	}
+
+	stats := a.RAG().Stats()
+	fmt.Printf("RAG Knowledge Base:\n")
+	fmt.Printf("  Documents: %d\n", stats.DocumentCount)
+	fmt.Printf("  Chunks: %d\n", stats.ChunkCount)
+	if !stats.LastIndexed.IsZero() {
+		fmt.Printf("  Last indexed: %s\n", stats.LastIndexed.Format("2006-01-02 15:04:05"))
+	}
+	if len(stats.Sources) > 0 {
+		fmt.Println("  Sources:")
+		for src, count := range stats.Sources {
+			fmt.Printf("    %s: %d chunks\n", src, count)
+		}
+	}
+	return nil
+}
+
+func runMemoryMigrateGraph(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	apply, _ := cmd.Flags().GetBool("apply")
+	archiveDirty, _ := cmd.Flags().GetBool("archive-dirty")
+	limit, _ := cmd.Flags().GetInt("limit")
+
+	store, err := memoryaestus.NewStore(filepath.Join(mgr.HomeDir(), "memory"))
+	if err != nil {
+		return fmt.Errorf("open memory store: %w", err)
+	}
+	defer store.Close()
+	report, err := store.MigrateGraphMemory(memory.GraphMigrationOptions{
+		Apply:            apply,
+		ArchiveDirty:     archiveDirty,
+		MaxDirtyFindings: limit,
+	})
+	if err != nil {
+		return err
+	}
+
+	if apply {
+		fmt.Println("Memory graph migration applied.")
+	} else {
+		fmt.Println("Memory graph migration dry-run. Re-run with --apply to write changes.")
+	}
+	fmt.Printf("  Scanned: %d\n", report.Scanned)
+	fmt.Printf("  Link updates: %d", report.WouldUpdateLinks)
+	if apply {
+		fmt.Printf(" (applied %d)", report.UpdatedLinks)
+	}
+	fmt.Println()
+	fmt.Printf("  Dirty archives: %d", report.WouldArchive)
+	if apply {
+		fmt.Printf(" (archived %d)", report.Archived)
+	}
+	fmt.Println()
+
+	maxShow := 12
+	if len(report.Entries) > 0 {
+		fmt.Println("  Planned entries:")
+		for i, entry := range report.Entries {
+			if i >= maxShow {
+				fmt.Printf("    ... %d more\n", len(report.Entries)-maxShow)
+				break
+			}
+			action := "link"
+			if entry.Archive {
+				action = "archive"
+			}
+			fmt.Printf("    - %s %s [%s/%s]", action, entry.ID, entry.Category, entry.Tier)
+			if entry.Path != "" {
+				fmt.Printf(" @%s", entry.Path)
+			}
+			fmt.Println()
+			if entry.Archive {
+				fmt.Printf("      reason=%s archive=%s\n", entry.Reason, entry.ArchivePath)
+				continue
+			}
+			if len(entry.AddLinks) > 0 {
+				fmt.Printf("      links=%s\n", strings.Join(entry.AddLinks, ", "))
+			}
+			if len(entry.AddTags) > 0 {
+				fmt.Printf("      tags=%s\n", strings.Join(entry.AddTags, ", "))
+			}
+		}
+	}
+	return nil
+}
+
+func runMemoryRenameNotes(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+
+	apply, _ := cmd.Flags().GetBool("apply")
+	limit, _ := cmd.Flags().GetInt("limit")
+	store, err := memoryaestus.NewStore(filepath.Join(mgr.HomeDir(), "memory"))
+	if err != nil {
+		return fmt.Errorf("open memory store: %w", err)
+	}
+	defer store.Close()
+	report, err := store.RenameNotes(memory.NoteRenameOptions{
+		Apply: apply,
+		Limit: limit,
+	})
+	if err != nil {
+		return err
+	}
+	if apply {
+		fmt.Println("Memory note rename applied.")
+	} else {
+		fmt.Println("Memory note rename dry-run. Re-run with --apply to rename files.")
+	}
+	fmt.Printf("  Scanned: %d\n", report.Scanned)
+	fmt.Printf("  Renames: %d", report.WouldRename)
+	if apply {
+		fmt.Printf(" (applied %d)", report.Renamed)
+	}
+	fmt.Println()
+	fmt.Printf("  Duplicate prunes: %d", report.WouldPruneDuplicates)
+	if apply {
+		fmt.Printf(" (pruned %d)", report.PrunedDuplicates)
+	}
+	fmt.Println()
+
+	maxShow := 20
+	if len(report.Entries) > 0 {
+		fmt.Println("  Planned renames:")
+		for i, entry := range report.Entries {
+			if i >= maxShow {
+				fmt.Printf("    ... %d more\n", len(report.Entries)-maxShow)
+				break
+			}
+			fmt.Printf("    - %s\n", entry.From)
+			fmt.Printf("      -> %s\n", entry.To)
+		}
+	}
+	if len(report.DuplicatePruneEntries) > 0 {
+		fmt.Println("  Duplicate notes:")
+		for i, entry := range report.DuplicatePruneEntries {
+			if i >= maxShow {
+				fmt.Printf("    ... %d more\n", len(report.DuplicatePruneEntries)-maxShow)
+				break
+			}
+			fmt.Printf("    - keep %s\n", entry.Keep)
+			fmt.Printf("      prune %s\n", entry.Remove)
+		}
+	}
+	return nil
+}
+
+func runMemoryTidalStats(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	path := memoryaestus.TidalStorePath(mgr.HomeDir(), cfg.Memory.Tidal.StorePath)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("Tidal memory store: %s\n", path)
+			fmt.Println("Status: no store found")
+			return nil
+		}
+		return fmt.Errorf("stat tidal memory store: %w", err)
+	}
+
+	store, err := memoryaestus.OpenTidalStore(path)
+	if err != nil {
+		return fmt.Errorf("open tidal memory store: %w", err)
+	}
+	defer store.Close()
+
+	stats, err := store.Stats()
+	if err != nil {
+		return fmt.Errorf("read tidal memory stats: %w", err)
+	}
+	kernels, err := store.LoadKernels()
+	if err != nil {
+		return fmt.Errorf("load tidal memory kernels: %w", err)
+	}
+
+	fmt.Printf("Tidal memory store: %s\n", path)
+	fmt.Printf("Enabled: %t\n", cfg.Memory.Tidal.Enabled)
+	fmt.Printf("Query events: %d\n", stats.QueryEvents)
+	fmt.Printf("Recall events: %d\n", stats.RecallEvents)
+	fmt.Printf("Feedback events: %d\n", stats.FeedbackEvents)
+	fmt.Printf("Kernels: %d\n", stats.Kernels)
+	limit := 10
+	if len(kernels) < limit {
+		limit = len(kernels)
+	}
+	for i := 0; i < limit; i++ {
+		kernel := kernels[i]
+		fmt.Printf("  %s feature=%s weights=%v counts=%v\n", kernel.Key, kernel.Feature, kernel.Weights, kernel.Counts)
+	}
+	return nil
+}
+
+func runProactiveStatus(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	path := cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath)
+
+	fmt.Printf("Proactive enabled: %t\n", cfg.Proactive.Enabled)
+	fmt.Printf("Dry-run: %t\n", proactiveDryRunEnabled(cfg))
+	fmt.Printf("Confidence threshold: %.2f\n", cfg.Proactive.ConfidenceThreshold)
+	fmt.Printf("Horizon seconds: %d\n", cfg.Proactive.HorizonSeconds)
+	fmt.Printf("Action interval seconds: %d\n", cfg.Proactive.ActionIntervalSecs)
+	fmt.Printf("Max actions per run: %d\n", cfg.Proactive.MaxActions)
+	fmt.Printf("Action cooldown seconds: %d\n", cfg.Proactive.ActionCooldownSecs)
+	fmt.Printf("Allowed actions: %s\n", strings.Join(cfg.Proactive.AllowedActions, ","))
+	fmt.Printf("Kernel learning: %t\n", proactiveKernelLearningEnabled(cfg))
+	fmt.Printf("Kernel learning rate: %.2f\n", cfg.Proactive.KernelLearningRate)
+	fmt.Printf("Kernel min samples: %d\n", cfg.Proactive.KernelMinSamples)
+	fmt.Printf("Store: %s\n", path)
+
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("Status: no store found")
+			return nil
+		}
+		return fmt.Errorf("stat proactive store: %w", err)
+	}
+	store, err := proactive.OpenStore(path)
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	stats, err := store.Stats()
+	if err != nil {
+		return fmt.Errorf("read proactive stats: %w", err)
+	}
+	fmt.Printf("Signals: %d\n", stats.Signals)
+	fmt.Printf("Estimates: %d\n", stats.Estimates)
+	fmt.Printf("Dry-run actions: %d\n", stats.Actions)
+	fmt.Printf("Feedback events: %d\n", stats.FeedbackEvents)
+	fmt.Printf("Runtime events: %d\n", stats.RuntimeEvents)
+	fmt.Printf("Action executions: %d\n", stats.Executions)
+	if feedbackStats, err := store.FeedbackStats(100); err != nil {
+		return err
+	} else if feedbackStats.Events > 0 {
+		fmt.Printf("Feedback accuracy: %.2f (%d/%d recent)\n", feedbackStats.Accuracy, feedbackStats.Correct, feedbackStats.Events)
+	}
+	if runtimeStats, err := store.RuntimeEventStats(); err != nil {
+		return err
+	} else if runtimeStats.Events > 0 {
+		fmt.Printf("Runtime event types: %s\n", formatRuntimeEventTypes(runtimeStats.ByType))
+	}
+	if kernelStats, err := store.KernelStats(); err != nil {
+		return err
+	} else if kernelStats.Weights > 0 {
+		fmt.Printf("Kernel weights: %d samples=%d\n", kernelStats.Weights, kernelStats.Samples)
+	}
+	if estimate, ok, err := store.LatestEstimate(); err != nil {
+		return err
+	} else if ok {
+		fmt.Printf("Latest estimate: %s confidence=%.2f noise=%.2f horizon=%s\n",
+			estimate.PredictedState, estimate.Confidence, estimate.NoiseVariance, estimate.Horizon)
+	}
+	return nil
+}
+
+func runProactiveSample(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	store, err := proactive.OpenStore(cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath))
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	sampler := proactive.NewSamplerWithStore("", store)
+	signals, err := sampler.Sample(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("sample proactive signals: %w", err)
+	}
+	if err := store.RecordSignals(signals); err != nil {
+		return fmt.Errorf("persist proactive signals: %w", err)
+	}
+
+	fmt.Printf("Sampled signals: %d\n", len(signals))
+	for _, signal := range signals {
+		fmt.Printf("  %s value=%.3f label=%s\n", signal.Channel, signal.Value, signal.Label)
+	}
+	return nil
+}
+
+func runProactiveDryRun(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	store, err := proactive.OpenStore(cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath))
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	gateCfg := proactive.Config{
+		Enabled:             cfg.Proactive.Enabled,
+		DryRun:              proactiveDryRunEnabled(cfg),
+		ConfidenceThreshold: cfg.Proactive.ConfidenceThreshold,
+		Horizon:             time.Duration(cfg.Proactive.HorizonSeconds) * time.Second,
+	}
+	runner := proactive.NewRunnerWithCalibrator(
+		proactive.NewSamplerWithStore("", store),
+		proactive.NewEstimator(),
+		cliProactiveCalibrator(store, cfg),
+		proactive.NewGate(gateCfg),
+		store,
+	)
+	decision, err := runner.RunDryRun(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("run proactive dry-run: %w", err)
+	}
+
+	fmt.Printf("Predicted state: %s\n", decision.Estimate.PredictedState)
+	fmt.Printf("Confidence: %.2f\n", decision.Estimate.Confidence)
+	fmt.Printf("Noise variance: %.2f\n", decision.Estimate.NoiseVariance)
+	fmt.Printf("Horizon: %s\n", decision.Estimate.Horizon)
+	if len(decision.Estimate.Reasons) > 0 {
+		fmt.Println("Reasons:")
+		for _, reason := range decision.Estimate.Reasons {
+			fmt.Printf("  - %s\n", reason)
+		}
+	}
+	fmt.Println("Dry-run actions:")
+	for _, action := range decision.Actions {
+		fmt.Printf("  - %s allowed=%t confidence=%.2f reason=%s\n", action.Action, action.Allowed, action.Confidence, action.Reason)
+	}
+	return nil
+}
+
+func runProactiveAct(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	store, err := proactive.OpenStore(cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath))
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	apply, _ := cmd.Flags().GetBool("apply")
+	dryRun := proactiveDryRunEnabled(cfg) || !apply
+	gateCfg := proactive.Config{
+		Enabled:             cfg.Proactive.Enabled,
+		DryRun:              dryRun,
+		ConfidenceThreshold: cfg.Proactive.ConfidenceThreshold,
+		Horizon:             time.Duration(cfg.Proactive.HorizonSeconds) * time.Second,
+	}
+	runner := proactive.NewRunnerWithCalibrator(
+		proactive.NewSamplerWithStore("", store),
+		proactive.NewEstimator(),
+		cliProactiveCalibrator(store, cfg),
+		proactive.NewGate(gateCfg),
+		store,
+	)
+	decision, err := runner.RunDryRun(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("run proactive decision: %w", err)
+	}
+
+	wd, _ := os.Getwd()
+	executor := proactive.NewActionExecutor(proactive.ActionPolicy{
+		Enabled:        cfg.Proactive.Enabled,
+		DryRun:         dryRun,
+		MaxActions:     cfg.Proactive.MaxActions,
+		Cooldown:       time.Duration(cfg.Proactive.ActionCooldownSecs) * time.Second,
+		WorkspaceDir:   wd,
+		HomeDir:        mgr.HomeDir(),
+		Allowed:        allowedActionMap(cfg.Proactive.AllowedActions),
+		ExecutionStore: store,
+	})
+	executions, err := executor.Execute(cmd.Context(), decision)
+	if err != nil {
+		return fmt.Errorf("execute proactive actions: %w", err)
+	}
+	if err := store.RecordActionExecutions(executions); err != nil {
+		return fmt.Errorf("persist proactive action executions: %w", err)
+	}
+
+	fmt.Printf("Predicted state: %s confidence=%.2f dry_run=%t enabled=%t\n",
+		decision.Estimate.PredictedState,
+		decision.Estimate.Confidence,
+		dryRun,
+		cfg.Proactive.Enabled,
+	)
+	fmt.Println("Action executions:")
+	for _, execution := range executions {
+		fmt.Printf("  - %s status=%s reason=%s\n", execution.Action, execution.Status, execution.Reason)
+		if len(execution.Metadata) > 0 {
+			fmt.Printf("    metadata=%s\n", formatStringMap(execution.Metadata))
+		}
+	}
+	if apply && proactiveDryRunEnabled(cfg) {
+		fmt.Println("Note: --apply was requested, but proactive.dry_run=true kept this run in dry-run mode.")
+	}
+	return nil
+}
+
+func runProactiveEvents(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	store, err := proactive.OpenStore(cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath))
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	limit, _ := cmd.Flags().GetInt("limit")
+	events, err := store.RecentRuntimeEvents(limit)
+	if err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		fmt.Println("No proactive runtime events found.")
+		return nil
+	}
+	for _, event := range events {
+		sessionID := event.SessionID
+		if sessionID == "" {
+			sessionID = "-"
+		}
+		fmt.Printf("%s type=%s name=%s source=%s session=%s value=%.2f\n",
+			event.CreatedAt.Local().Format(time.RFC3339),
+			event.Type,
+			event.Name,
+			event.Source,
+			sessionID,
+			event.Value,
+		)
+		if len(event.Metadata) > 0 {
+			fmt.Printf("  metadata=%s\n", formatStringMap(event.Metadata))
+		}
+	}
+	return nil
+}
+
+func runProactiveExecutions(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	store, err := proactive.OpenStore(cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath))
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	limit, _ := cmd.Flags().GetInt("limit")
+	executions, err := store.RecentActionExecutions(limit)
+	if err != nil {
+		return err
+	}
+	if len(executions) == 0 {
+		fmt.Println("No proactive action executions found.")
+		return nil
+	}
+	for _, execution := range executions {
+		fmt.Printf("%s action=%s status=%s reason=%s\n",
+			execution.CreatedAt.Local().Format(time.RFC3339),
+			execution.Action,
+			execution.Status,
+			execution.Reason,
+		)
+		if len(execution.Metadata) > 0 {
+			fmt.Printf("  metadata=%s\n", formatStringMap(execution.Metadata))
+		}
+	}
+	return nil
+}
+
+func runProactiveKernels(cmd *cobra.Command, args []string) error {
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	store, err := proactive.OpenStore(cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath))
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	limit, _ := cmd.Flags().GetInt("limit")
+	weights, err := store.RecentSignalWeights(limit)
+	if err != nil {
+		return err
+	}
+	if len(weights) == 0 {
+		fmt.Println("No proactive signal kernels found.")
+		return nil
+	}
+	for _, weight := range weights {
+		fmt.Printf("%s state=%s signal=%s/%s weight=%.3f samples=%d\n",
+			weight.UpdatedAt.Local().Format(time.RFC3339),
+			weight.PredictedState,
+			weight.Channel,
+			weight.Label,
+			weight.Weight,
+			weight.Samples,
+		)
+	}
+	return nil
+}
+
+func runProactiveFeedback(cmd *cobra.Command, args []string) error {
+	actualState := strings.TrimSpace(args[0])
+	if actualState == "" {
+		return fmt.Errorf("actual state is required")
+	}
+
+	mgr, err := config.NewManager()
+	if err != nil {
+		return err
+	}
+	if err := mgr.Load(); err != nil {
+		return err
+	}
+	cfg := mgr.Get()
+	store, err := proactive.OpenStore(cliProactiveStorePath(mgr.HomeDir(), cfg.Proactive.StorePath))
+	if err != nil {
+		return fmt.Errorf("open proactive store: %w", err)
+	}
+	defer store.Close()
+
+	stateID, _ := cmd.Flags().GetString("state-id")
+	var estimate proactive.StateEstimate
+	var ok bool
+	if strings.TrimSpace(stateID) != "" {
+		estimate, ok, err = store.EstimateByID(stateID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("proactive estimate %q not found", stateID)
+		}
+	} else {
+		estimate, ok, err = store.LatestEstimate()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no proactive estimate found; run `la proactive dry-run` first")
+		}
+	}
+	value, _ := cmd.Flags().GetFloat64("value")
+	source, _ := cmd.Flags().GetString("source")
+	note, _ := cmd.Flags().GetString("note")
+	event := proactive.FeedbackEvent{
+		StateID:        estimate.ID,
+		PredictedState: estimate.PredictedState,
+		ActualState:    actualState,
+		Value:          value,
+		Source:         source,
+		Note:           note,
+		CreatedAt:      time.Now(),
+	}
+	if err := store.RecordFeedback(event); err != nil {
+		return fmt.Errorf("record proactive feedback: %w", err)
+	}
+	kernelUpdates, err := store.LearnFromFeedback(event, proactive.KernelLearningConfig{
+		Enabled:      proactiveKernelLearningEnabled(cfg),
+		LearningRate: cfg.Proactive.KernelLearningRate,
+	})
+	if err != nil {
+		return fmt.Errorf("learn proactive kernel from feedback: %w", err)
+	}
+
+	correct := strings.EqualFold(estimate.PredictedState, actualState)
+	fmt.Printf("Recorded feedback: predicted=%s actual=%s correct=%t\n", estimate.PredictedState, actualState, correct)
+	if proactiveKernelLearningEnabled(cfg) {
+		fmt.Printf("Kernel updates: %d\n", kernelUpdates)
+	}
+	if feedbackStats, err := store.FeedbackStats(100); err == nil && feedbackStats.Events > 0 {
+		fmt.Printf("Recent feedback accuracy: %.2f (%d/%d)\n", feedbackStats.Accuracy, feedbackStats.Correct, feedbackStats.Events)
+	}
+	return nil
+}
+
+func proactiveDryRunEnabled(cfg *config.Config) bool {
+	if cfg == nil || cfg.Proactive.DryRun == nil {
+		return true
+	}
+	return *cfg.Proactive.DryRun
+}
+
+func proactiveKernelLearningEnabled(cfg *config.Config) bool {
+	if cfg == nil || cfg.Proactive.KernelLearning == nil {
+		return true
+	}
+	return *cfg.Proactive.KernelLearning
+}
+
+func cliProactiveCalibrator(store *proactive.Store, cfg *config.Config) proactive.FeedbackCalibrator {
+	calibrator := proactive.NewFeedbackCalibrator(store)
+	if cfg != nil {
+		calibrator.KernelMinSamples = cfg.Proactive.KernelMinSamples
+	}
+	return calibrator
+}
+
+func cliProactiveStorePath(homeDir, configured string) string {
+	configured = strings.TrimSpace(configured)
+	if configured == "" {
+		return filepath.Join(homeDir, "runtime", "proactive_state.db")
+	}
+	if filepath.IsAbs(configured) {
+		return configured
+	}
+	return filepath.Join(homeDir, configured)
+}
+
+func allowedActionMap(actions []string) map[string]bool {
+	if actions == nil {
+		return nil
+	}
+	allowed := make(map[string]bool, len(actions))
+	for _, action := range actions {
+		action = strings.TrimSpace(action)
+		if action != "" {
+			allowed[action] = true
+		}
+	}
+	return allowed
+}
+
+func formatRuntimeEventTypes(byType map[string]int) string {
+	if len(byType) == 0 {
+		return "-"
+	}
+	keys := make([]string, 0, len(byType))
+	for key := range byType {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, byType[key]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatStringMap(values map[string]string) string {
+	if len(values) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%s", key, values[key]))
+	}
+	return strings.Join(parts, ", ")
+}

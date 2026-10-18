@@ -1,0 +1,71 @@
+// Package luckyagent binds the application service to the independent wire protocol.
+package luckyagent
+
+import transport "github.com/yurika0211/luckyagent-api/grpc"
+
+type ChatChunk = transport.ChatChunk
+type ChatRequest = transport.ChatRequest
+type ChatResponse = transport.ChatResponse
+type ComponentHealth = transport.ComponentHealth
+
+var File_luckyagent_proto = transport.File_luckyagent_proto
+
+type HealthCheckResponse = transport.HealthCheckResponse
+type LuckyAgentServiceClient = transport.LuckyAgentServiceClient
+type LuckyAgentServiceServer = transport.LuckyAgentServiceServer
+type LuckyAgentService_ChatStreamClient = transport.LuckyAgentService_ChatStreamClient
+type LuckyAgentService_ChatStreamServer = transport.LuckyAgentService_ChatStreamServer
+
+const LuckyAgentService_ChatStream_FullMethodName = transport.LuckyAgentService_ChatStream_FullMethodName
+const LuckyAgentService_Chat_FullMethodName = transport.LuckyAgentService_Chat_FullMethodName
+const LuckyAgentService_HealthCheck_FullMethodName = transport.LuckyAgentService_HealthCheck_FullMethodName
+const LuckyAgentService_MemoryDelete_FullMethodName = transport.LuckyAgentService_MemoryDelete_FullMethodName
+const LuckyAgentService_MemoryList_FullMethodName = transport.LuckyAgentService_MemoryList_FullMethodName
+const LuckyAgentService_MemoryRecall_FullMethodName = transport.LuckyAgentService_MemoryRecall_FullMethodName
+const LuckyAgentService_MemoryStore_FullMethodName = transport.LuckyAgentService_MemoryStore_FullMethodName
+const LuckyAgentService_RAGIndex_FullMethodName = transport.LuckyAgentService_RAGIndex_FullMethodName
+const LuckyAgentService_RAGSearch_FullMethodName = transport.LuckyAgentService_RAGSearch_FullMethodName
+
+var LuckyAgentService_ServiceDesc = transport.LuckyAgentService_ServiceDesc
+
+const LuckyAgentService_WorkflowCreate_FullMethodName = transport.LuckyAgentService_WorkflowCreate_FullMethodName
+const LuckyAgentService_WorkflowDelete_FullMethodName = transport.LuckyAgentService_WorkflowDelete_FullMethodName
+const LuckyAgentService_WorkflowGet_FullMethodName = transport.LuckyAgentService_WorkflowGet_FullMethodName
+const LuckyAgentService_WorkflowInstanceGet_FullMethodName = transport.LuckyAgentService_WorkflowInstanceGet_FullMethodName
+const LuckyAgentService_WorkflowList_FullMethodName = transport.LuckyAgentService_WorkflowList_FullMethodName
+const LuckyAgentService_WorkflowStart_FullMethodName = transport.LuckyAgentService_WorkflowStart_FullMethodName
+
+type MemoryDeleteRequest = transport.MemoryDeleteRequest
+type MemoryEntry = transport.MemoryEntry
+type MemoryListResponse = transport.MemoryListResponse
+type MemoryRecallRequest = transport.MemoryRecallRequest
+type MemoryRecallResponse = transport.MemoryRecallResponse
+type MemoryStoreRequest = transport.MemoryStoreRequest
+
+var NewLuckyAgentServiceClient = transport.NewLuckyAgentServiceClient
+
+type RAGIndexRequest = transport.RAGIndexRequest
+type RAGIndexResponse = transport.RAGIndexResponse
+type RAGResult = transport.RAGResult
+type RAGSearchRequest = transport.RAGSearchRequest
+type RAGSearchResponse = transport.RAGSearchResponse
+
+var RegisterLuckyAgentServiceHandler = transport.RegisterLuckyAgentServiceHandler
+var RegisterLuckyAgentServiceHandlerClient = transport.RegisterLuckyAgentServiceHandlerClient
+var RegisterLuckyAgentServiceHandlerFromEndpoint = transport.RegisterLuckyAgentServiceHandlerFromEndpoint
+var RegisterLuckyAgentServiceHandlerServer = transport.RegisterLuckyAgentServiceHandlerServer
+var RegisterLuckyAgentServiceServer = transport.RegisterLuckyAgentServiceServer
+
+type Task = transport.Task
+type TaskResult = transport.TaskResult
+type ToolCall = transport.ToolCall
+type UnimplementedLuckyAgentServiceServer = transport.UnimplementedLuckyAgentServiceServer
+type UnsafeLuckyAgentServiceServer = transport.UnsafeLuckyAgentServiceServer
+type Workflow = transport.Workflow
+type WorkflowCreateRequest = transport.WorkflowCreateRequest
+type WorkflowDeleteRequest = transport.WorkflowDeleteRequest
+type WorkflowGetRequest = transport.WorkflowGetRequest
+type WorkflowInstance = transport.WorkflowInstance
+type WorkflowInstanceGetRequest = transport.WorkflowInstanceGetRequest
+type WorkflowListResponse = transport.WorkflowListResponse
+type WorkflowStartRequest = transport.WorkflowStartRequest

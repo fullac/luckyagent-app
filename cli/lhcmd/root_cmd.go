@@ -1,0 +1,398 @@
+package lhcmd
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/yurika0211/luckyagent-runtime/config"
+	"github.com/yurika0211/luckyagent-runtime/logger"
+)
+
+type commandStartTimeKey struct{}
+
+var commandLoggerInitOnce sync.Once
+
+func initCommandLogger() {
+	commandLoggerInitOnce.Do(func() {
+		logCfg := logger.DefaultConfig()
+
+		// 尝试从配置读取日志级别/格式；失败时回退默认值。
+		if mgr, err := config.NewManager(); err == nil {
+			if err := mgr.Load(); err == nil {
+				cfg := mgr.Get()
+				if cfg.Server.LogLevel != "" {
+					logCfg.Level = cfg.Server.LogLevel
+				}
+				if cfg.Server.LogFormat != "" {
+					logCfg.Format = cfg.Server.LogFormat
+				}
+			}
+		}
+
+		logger.InitLogger(logCfg)
+	})
+}
+
+func newRootCmd() *cobra.Command {
+	rootCmd := &cobra.Command{
+		Use:   "lh",
+		Short: "LuckyAgent bot-first CLI",
+		Long:  "LuckyAgent 精简版命令行入口，面向聊天与消息网关工作流。",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			initCommandLogger()
+
+			startAt := time.Now()
+			ctx := cmd.Context()
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			cmd.SetContext(context.WithValue(ctx, commandStartTimeKey{}, startAt))
+
+			logger.Info("command started",
+				"command", cmd.CommandPath(),
+				"args_count", len(args),
+			)
+		},
+		PersistentPostRun: func(cmd *cobra.Command, _ []string) {
+			var duration time.Duration
+			if ctx := cmd.Context(); ctx != nil {
+				if startAt, ok := ctx.Value(commandStartTimeKey{}).(time.Time); ok && !startAt.IsZero() {
+					duration = time.Since(startAt)
+				}
+			}
+
+			logger.Info("command completed",
+				"command", cmd.CommandPath(),
+				"duration_ms", duration.Milliseconds(),
+			)
+		},
+	}
+
+	initCmd := &cobra.Command{
+		Use:   "init",
+		Short: "初始化 LuckyAgent 主目录",
+		RunE:  runInit,
+	}
+
+	chatCmd := &cobra.Command{
+		Use:   "chat [message]",
+		Short: "本地调试对话",
+		RunE:  runChat,
+	}
+	chatCmd.Flags().StringVarP(&soulFile, "soul", "s", "", "SOUL.md 文件路径")
+	chatCmd.Flags().StringVarP(&provider_, "provider", "p", "", "LLM 提供商")
+	chatCmd.Flags().StringVarP(&model_, "model", "m", "", "模型名称")
+	chatCmd.Flags().BoolVar(&yolo, "yolo", false, "自动批准所有工具调用")
+	chatCmd.Flags().SetInterspersed(false)
+
+	configCmd := &cobra.Command{
+		Use:     "config",
+		Aliases: []string{"cfg"},
+		Short:   "管理配置",
+	}
+	configGetCmd := &cobra.Command{
+		Use:     "get [key]",
+		Aliases: []string{"g"},
+		Short:   "获取配置项",
+		Args:    cobra.ExactArgs(1),
+		RunE:    runConfigGet,
+	}
+	configSetCmd := &cobra.Command{
+		Use:     "set [key] [value]",
+		Aliases: []string{"s"},
+		Short:   "设置配置项",
+		Args:    cobra.ExactArgs(2),
+		RunE:    runConfigSet,
+	}
+	configListCmd := &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "列出所有配置",
+		RunE:    runConfigList,
+	}
+	configTimeoutCmd := &cobra.Command{
+		Use:     "timeout",
+		Aliases: []string{"t"},
+		Short:   "查看各运行层的有效超时配置",
+		Args:    cobra.NoArgs,
+		RunE:    runConfigTimeout,
+	}
+	configCmd.AddCommand(configGetCmd, configSetCmd, configListCmd, configTimeoutCmd)
+
+	credentialCmd := &cobra.Command{
+		Use:     "credential",
+		Aliases: []string{"credentials", "cred"},
+		Short:   "管理本地加密凭据",
+	}
+	credentialAddCmd := &cobra.Command{
+		Use:   "add <id>",
+		Short: "通过隐藏输入保存凭据",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			kind, err := cmd.Flags().GetString("kind")
+			if err != nil {
+				return err
+			}
+			scope, err := cmd.Flags().GetString("scope")
+			if err != nil {
+				return err
+			}
+			mgr, err := config.NewManager()
+			if err != nil {
+				return err
+			}
+			return runCredentialAdd(credentialCommandArgs{homeDir: mgr.HomeDir(), id: args[0], kind: kind, scope: scope})
+		},
+	}
+	credentialAddCmd.Flags().String("kind", "generic", "凭据类型")
+	credentialAddCmd.Flags().String("scope", "default", "配置域")
+	credentialListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "列出凭据元数据",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			mgr, err := config.NewManager()
+			if err != nil {
+				return err
+			}
+			return runCredentialList(mgr.HomeDir())
+		},
+	}
+	credentialRemoveCmd := &cobra.Command{
+		Use:   "remove <id>",
+		Short: "删除凭据",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mgr, err := config.NewManager()
+			if err != nil {
+				return err
+			}
+			return runCredentialRemove(mgr.HomeDir(), args[0])
+		},
+	}
+	credentialCmd.AddCommand(credentialAddCmd, credentialListCmd, credentialRemoveCmd)
+
+	diagCmd := &cobra.Command{Use: "diag", Aliases: []string{"d"}, Short: "查看运行诊断信息"}
+	diagTimeoutCmd := &cobra.Command{
+		Use:     "timeout",
+		Aliases: []string{"t"},
+		Short:   "查看最近一次超时诊断",
+		Args:    cobra.NoArgs,
+		RunE:    runDiagTimeout,
+	}
+	diagCmd.AddCommand(diagTimeoutCmd)
+
+	soulCmd := &cobra.Command{
+		Use:   "soul",
+		Short: "管理 SOUL",
+	}
+	soulShowCmd := &cobra.Command{
+		Use:   "show",
+		Short: "显示当前 SOUL",
+		RunE:  runSoulShow,
+	}
+	soulListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "列出所有 SOUL 模板",
+		RunE:  runSoulList,
+	}
+	soulListCmd.Flags().StringP("language", "l", "", "按语言过滤 (zh/en/ja/ko)")
+	soulSwitchCmd := &cobra.Command{
+		Use:   "switch <template-id>",
+		Short: "切换到指定 SOUL 模板",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runSoulSwitch,
+	}
+	soulCmd.AddCommand(soulShowCmd, soulListCmd, soulSwitchCmd)
+
+	versionCmd := &cobra.Command{
+		Use:     "version",
+		Aliases: []string{"v"},
+		Short:   "显示版本",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("LuckyAgent %s\n", buildVersion)
+			fmt.Printf("   commit: %s\n", buildCommit)
+			fmt.Printf("   date:   %s\n", buildDate)
+		},
+	}
+
+	serveCmd := &cobra.Command{
+		Use:     "serve",
+		Aliases: []string{"api"},
+		Short:   "启动 HTTP API Server",
+		RunE:    runServe,
+	}
+	serveCmd.Flags().StringP("addr", "a", "", "监听地址，默认使用 config.json 中的 server.addr")
+
+	qrCmd := newQRCmd()
+
+	msgGatewayCmd := &cobra.Command{
+		Use:     "msg-gateway",
+		Aliases: []string{"gw", "gateway"},
+		Short:   "消息平台网关管理",
+	}
+	msgGatewayStartCmd := &cobra.Command{
+		Use:     "start [--platform PLATFORM]",
+		Aliases: []string{"s", "run"},
+		Short:   "启动消息网关",
+		RunE:    runMsgGatewayStart,
+	}
+	msgGatewayStartCmd.Flags().StringP("platform", "p", "", "平台名称 (telegram/tg, qqofficial/qq, napcat/nap, feishu/fs, weixin/wx, openclawweixin/ocwx)")
+	msgGatewayStartCmd.Flags().String("token", "", "Bot token (Telegram)")
+	msgGatewayStartCmd.Flags().String("qq-appid", "", "QQ 官方机器人 AppID")
+	msgGatewayStartCmd.Flags().String("qq-appsecret", "", "QQ 官方机器人 AppSecret")
+	msgGatewayStartCmd.Flags().Bool("qq-sandbox", false, "QQ 官方机器人沙箱环境")
+	msgGatewayStartCmd.Flags().String("napcat-listen", "", "NapCat OneBot 反向 WebSocket 监听地址")
+	msgGatewayStartCmd.Flags().String("napcat-path", "", "NapCat OneBot 反向 WebSocket 路径")
+	msgGatewayStartCmd.Flags().String("napcat-access-token", "", "NapCat OneBot 访问令牌")
+	msgGatewayStartCmd.Flags().String("feishu-app-id", "", "飞书应用 App ID")
+	msgGatewayStartCmd.Flags().String("feishu-app-secret", "", "飞书应用 App Secret")
+	msgGatewayStartCmd.Flags().String("feishu-verification-token", "", "可选：填写后使用飞书 HTTP 事件回调")
+	msgGatewayStartCmd.Flags().String("feishu-listen", "", "飞书事件回调监听地址")
+	msgGatewayStartCmd.Flags().String("feishu-path", "", "飞书事件回调路径")
+	msgGatewayStartCmd.Flags().BoolP("all", "a", false, "启动所有已配置的网关")
+	msgGatewayWeixinLoginCmd := &cobra.Command{
+		Use:     "weixin-login",
+		Aliases: []string{"login"},
+		Short:   "获取微信登录二维码并写回 iLink 配置",
+		RunE:    runMsgGatewayWeixinLogin,
+	}
+	msgGatewayWeixinLoginCmd.Flags().String("driver", "ilink", "weixin login driver: ilink or openclaw")
+	msgGatewayWeixinLoginCmd.Flags().String("base-url", "", "iLink API base URL")
+	msgGatewayWeixinLoginCmd.Flags().Duration("poll-interval", 2*time.Second, "二维码状态轮询间隔")
+	msgGatewayWeixinLoginCmd.Flags().Duration("timeout", 3*time.Minute, "扫码登录超时时间")
+	msgGatewayWeixinLoginCmd.Flags().Bool("no-save", false, "只打印登录结果，不写入 config.json")
+	msgGatewayWeixinLoginCmd.Flags().Bool("print-status", true, "打印二维码状态变化")
+	msgGatewayCmd.AddCommand(msgGatewayStartCmd, msgGatewayWeixinLoginCmd)
+
+	ragCmd := &cobra.Command{
+		Use:     "rag",
+		Aliases: []string{"kb"},
+		Short:   "RAG 知识库管理",
+	}
+	ragIndexCmd := &cobra.Command{
+		Use:     "index <path>",
+		Aliases: []string{"i"},
+		Short:   "索引文件或目录到知识库",
+		Args:    cobra.ExactArgs(1),
+		RunE:    runRAGIndex,
+	}
+	ragSearchCmd := &cobra.Command{
+		Use:     "search <query>",
+		Aliases: []string{"s"},
+		Short:   "搜索知识库",
+		Args:    cobra.ExactArgs(1),
+		RunE:    runRAGSearch,
+	}
+	ragStatsCmd := &cobra.Command{
+		Use:     "stats",
+		Aliases: []string{"st"},
+		Short:   "知识库统计",
+		RunE:    runRAGStats,
+	}
+	ragCmd.AddCommand(ragIndexCmd, ragSearchCmd, ragStatsCmd)
+
+	memoryCmd := &cobra.Command{
+		Use:     "memory",
+		Aliases: []string{"mem"},
+		Short:   "管理 LuckyAgent Markdown 记忆库",
+	}
+	memoryMigrateGraphCmd := &cobra.Command{
+		Use:    "migrate-graph",
+		Short:  "将现有记忆迁移为 Obsidian-first graph memory",
+		Hidden: true,
+		RunE:   runMemoryMigrateGraph,
+	}
+	memoryMigrateGraphCmd.Flags().Bool("apply", false, "实际写入迁移结果；默认只 dry-run")
+	memoryMigrateGraphCmd.Flags().Bool("archive-dirty", true, "将 high/critical 脏记忆归档到 90_Archive/dirty")
+	memoryMigrateGraphCmd.Flags().Int("limit", 200, "最多审计/展示的脏记忆数量")
+	memoryRenameNotesCmd := &cobra.Command{
+		Use:    "rename-notes",
+		Short:  "Rename memory notes to human-readable Obsidian filenames",
+		Hidden: true,
+		RunE:   runMemoryRenameNotes,
+	}
+	memoryRenameNotesCmd.Flags().Bool("apply", false, "Write renamed files; default is dry-run")
+	memoryRenameNotesCmd.Flags().Int("limit", 1000, "Maximum planned note renames")
+	memoryTidalCmd := &cobra.Command{
+		Use:     "tidal",
+		Aliases: []string{"td"},
+		Short:   "管理潮汐记忆 reranker",
+	}
+	memoryTidalNestedStatsCmd := &cobra.Command{
+		Use:     "stats",
+		Aliases: []string{"st"},
+		Short:   "查看潮汐记忆 reranker 的持久化统计",
+		RunE:    runMemoryTidalStats,
+	}
+	memoryTidalCmd.AddCommand(memoryTidalNestedStatsCmd)
+	memoryCmd.AddCommand(memoryMigrateGraphCmd, memoryRenameNotesCmd, memoryTidalCmd)
+
+	proactiveCmd := &cobra.Command{
+		Use:     "proactive",
+		Aliases: []string{"pro"},
+		Short:   "管理 proactive state estimator",
+		Hidden:  true,
+	}
+	proactiveStatusCmd := &cobra.Command{
+		Use:   "status",
+		Short: "查看 proactive 配置和持久化统计",
+		RunE:  runProactiveStatus,
+	}
+	proactiveSampleCmd := &cobra.Command{
+		Use:   "sample",
+		Short: "采样当前 proactive 信号并写入本地 store",
+		RunE:  runProactiveSample,
+	}
+	proactiveDryRunCmd := &cobra.Command{
+		Use:   "dry-run",
+		Short: "运行一次 proactive gate dry-run",
+		RunE:  runProactiveDryRun,
+	}
+	proactiveActCmd := &cobra.Command{
+		Use:   "act",
+		Short: "执行一次受安全策略限制的 proactive action run",
+		RunE:  runProactiveAct,
+	}
+	proactiveActCmd.Flags().Bool("apply", false, "实际执行 allowlist 内的安全动作；默认只 dry-run")
+	proactiveFeedbackCmd := &cobra.Command{
+		Use:   "feedback <actual-state>",
+		Short: "记录最近一次 proactive 预测的实际结果",
+		Args:  cobra.ExactArgs(1),
+		RunE:  runProactiveFeedback,
+	}
+	proactiveFeedbackCmd.Flags().String("state-id", "", "要反馈的 state estimate id；默认使用最新估计")
+	proactiveFeedbackCmd.Flags().Float64("value", 0, "反馈值；0 表示自动按 actual==predicted 记为 1，否则 -1")
+	proactiveFeedbackCmd.Flags().String("source", "cli", "反馈来源")
+	proactiveFeedbackCmd.Flags().String("note", "", "反馈备注")
+	proactiveEventsCmd := &cobra.Command{
+		Use:   "events",
+		Short: "查看最近 proactive runtime events",
+		RunE:  runProactiveEvents,
+	}
+	proactiveEventsCmd.Flags().Int("limit", 20, "最多显示的事件数量")
+	proactiveExecutionsCmd := &cobra.Command{
+		Use:   "executions",
+		Short: "查看最近 proactive action executions",
+		RunE:  runProactiveExecutions,
+	}
+	proactiveExecutionsCmd.Flags().Int("limit", 20, "最多显示的执行记录数量")
+	proactiveKernelsCmd := &cobra.Command{
+		Use:   "kernels",
+		Short: "查看最近 learned proactive signal kernels",
+		RunE:  runProactiveKernels,
+	}
+	proactiveKernelsCmd.Flags().Int("limit", 20, "最多显示的 kernel 权重数量")
+	proactiveCmd.AddCommand(proactiveStatusCmd, proactiveSampleCmd, proactiveDryRunCmd, proactiveActCmd, proactiveFeedbackCmd, proactiveEventsCmd, proactiveExecutionsCmd, proactiveKernelsCmd)
+
+	rootCmd.AddCommand(initCmd, chatCmd, configCmd, credentialCmd, diagCmd, soulCmd, versionCmd, newUpdateCmd(), serveCmd, qrCmd, msgGatewayCmd, ragCmd, memoryCmd, proactiveCmd, newSessionCmd())
+
+	return rootCmd
+}

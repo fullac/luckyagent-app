@@ -1,0 +1,4832 @@
+package telegram
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/yurika0211/luckyagent-gateway/telegram/presentation"
+	"html"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/yurika0211/lucky-agent/agent"
+	"github.com/yurika0211/luckyagent-app/appservice"
+	"github.com/yurika0211/luckyagent-runtime/appservice/profile"
+	"github.com/yurika0211/luckyagent-runtime/config"
+	"github.com/yurika0211/luckyagent-runtime/embedder"
+	"github.com/yurika0211/luckyagent-runtime/gateway"
+	luckycollector "github.com/yurika0211/luckyagent-runtime/gateway/collector"
+	"github.com/yurika0211/luckyagent-runtime/mcpclient"
+	"github.com/yurika0211/luckyagent-runtime/metrics"
+	"github.com/yurika0211/luckyagent-runtime/provider"
+	"github.com/yurika0211/luckyagent-runtime/rag"
+	"github.com/yurika0211/luckyagent-runtime/sandbox"
+	"github.com/yurika0211/luckyagent-runtime/session"
+	"github.com/yurika0211/luckyagent-runtime/soul"
+	"github.com/yurika0211/luckyagent-runtime/tool"
+	"github.com/yurika0211/luckyagent-runtime/turn"
+	"github.com/yurika0211/luckyagent-runtime/utils"
+	"github.com/yurika0211/luckyagent-tools/cron"
+	"github.com/yurika0211/luckyagent-tools/memory"
+	taskstore "github.com/yurika0211/luckyagent-tools/task"
+)
+
+type chatRuntime interface {
+	Chat(ctx context.Context, userInput string) (string, error)
+	ChatWithSession(ctx context.Context, sessionID, userInput string) (string, error)
+	ChatWithSessionInput(ctx context.Context, sessionID string, input agent.UserTurnInput) (string, error)
+	ChatWithSessionStream(ctx context.Context, sessionID, userInput string) (<-chan agent.ChatEvent, error)
+	ChatWithSessionStreamInput(ctx context.Context, sessionID string, input agent.UserTurnInput) (<-chan agent.ChatEvent, error)
+	ProgressFeedback(ctx context.Context, userInput string, round int, observations []string) (string, error)
+	ProgressFeedbackWithPrompt(ctx context.Context, userInput string, round int, observations []string, presentationPrompt string) (string, error)
+}
+
+// turnChatRuntime is the narrow, provider-independent chat boundary. The
+// legacy methods remain in chatRuntime while adapters are migrated one path at
+// a time, so existing gateway test doubles and command handlers keep working.
+type legacyTurnChatRuntime interface {
+	ChatWithSessionTurn(ctx context.Context, sessionID string, input turn.Input) (string, error)
+	ChatWithSessionStreamTurn(ctx context.Context, sessionID string, input turn.Input) (<-chan agent.ChatEvent, error)
+}
+
+// turnEventChatRuntime is the neutral stream variant. It is optional during
+// migration so existing command test doubles can keep implementing the legacy
+// stream method while production adapters move to turn.ChatEvent.
+type turnEventChatRuntime = turn.ChatRuntime
+
+type stateRuntime interface {
+	Sessions() *session.Manager
+	Config() AgentConfigProvider
+	SwitchModel(modelID string) error
+	Soul() *soul.Soul
+	Tools() *tool.Registry
+	CronEngine() *cron.Engine
+	Skills() []*tool.SkillInfo
+	Metrics() *metrics.Metrics
+	Memory() memory.Inspector
+	Remember(content, category string) error
+	RememberLongTerm(content, category string) error
+	Recall(query string) []memory.Entry
+	MemoryStats() map[memory.Tier]int
+	DecayMemory(threshold float64) int
+	PromoteMemory(id string) error
+	Catalog() *provider.ModelCatalog
+	RAG() *rag.RAGManager
+	ContextWindowConfig() ContextWindowSnapshot
+	ContextCacheStats() map[string]any
+	EmbedderRegistry() *embedder.Registry
+}
+
+type unifiedModelRuntime interface {
+	SwitchModelKind(kind config.ModelKind, modelID string, opts agent.SwitchModelOptions) error
+	CurrentModel(kind config.ModelKind) (agent.ModelRef, bool)
+	ListModels(kind *config.ModelKind) []agent.ModelRef
+	ModelProfiles() map[string]map[config.ModelKind]string
+	ApplyModelProfile(name string) error
+}
+
+type agentProvider interface {
+	chatRuntime
+	stateRuntime
+}
+
+// Runtime is the gateway-facing contract used to build a Telegram handler.
+// The legacy NewHandler constructor still accepts *agent.Agent for source
+// compatibility; new assembly code can provide this contract directly via
+// NewHandlerWithRuntime.
+type Runtime = agentProvider
+
+func chatWithSessionTurn(ctx context.Context, runtime chatRuntime, sessionID string, input agent.UserTurnInput) (string, error) {
+	if narrow, ok := runtime.(turnEventChatRuntime); ok {
+		return narrow.ChatWithSessionTurn(ctx, sessionID, agent.TurnInput(input))
+	}
+	return runtime.ChatWithSessionInput(ctx, sessionID, input)
+}
+
+func chatWithSessionStreamTurn(ctx context.Context, runtime chatRuntime, sessionID string, input agent.UserTurnInput) (<-chan agent.ChatEvent, error) {
+	if neutral, ok := runtime.(turnEventChatRuntime); ok {
+		events, err := neutral.ChatWithSessionStreamTurnEvents(ctx, sessionID, agent.TurnInput(input))
+		if err != nil {
+			return nil, err
+		}
+		return agent.FromTurnChatEventStream(ctx, events), nil
+	}
+	if narrow, ok := runtime.(legacyTurnChatRuntime); ok {
+		return narrow.ChatWithSessionStreamTurn(ctx, sessionID, agent.TurnInput(input))
+	}
+	return runtime.ChatWithSessionStreamInput(ctx, sessionID, input)
+}
+
+type sandboxRuntime interface {
+	SandboxMode() sandbox.Mode
+	SetSandboxMode(string) error
+}
+
+type activeRouteRecorder interface {
+	RecordRecentChatTarget(platform, chatID, replyToMsgID string)
+}
+
+type replyAnchorResolver interface {
+	ResolveExternalReplyAnchor(platform, chatID, messageID string) (sessionID string, ok bool)
+}
+
+type telegramSender interface {
+	gateway.StreamGateway
+	SendPhoto(ctx context.Context, chatID string, replyToMsgID string, source string, caption string) error
+	SendDocument(ctx context.Context, chatID string, replyToMsgID string, source string, caption string) error
+	SendHTML(ctx context.Context, chatID string, message string) error
+	SendWithReplyHTML(ctx context.Context, chatID string, replyToMsgID string, message string) error
+	SendTypingLoop(ctx context.Context, chatID string)
+	ReactToMessage(chatID string, messageID string, emoji string)
+}
+
+type restartNoticeSender interface {
+	SendControl(context.Context, string, string) error
+}
+
+// AgentConfigProvider defines the configuration view consumed by the
+// Telegram handler. It is exported so an embedding application can provide a
+// Runtime implementation without depending on an unexported return type.
+type AgentConfigProvider interface {
+	Get() agentConfigSnapshot
+}
+
+// agentConfigProvider is retained as an in-package compatibility alias.
+type agentConfigProvider = AgentConfigProvider
+
+type mutableAgentConfigProvider interface {
+	AgentConfigProvider
+	Set(key, value string) error
+	Save() error
+}
+
+// agentConfigSnapshot 是 config 快照的最小子集。
+// AgentConfigSnapshot is the configuration subset exposed to the Telegram
+// command surface.
+type AgentConfigSnapshot struct {
+	HomeDir                   string
+	ConfigFile                string
+	Model                     string
+	Provider                  string
+	APIKey                    string
+	APIBase                   string
+	ExtraHeaders              map[string]string
+	CustomModels              []provider.ModelInfo
+	SoulPath                  string
+	MaxTokens                 int
+	Temperature               float64
+	ServerAddr                string
+	MsgGatewayPlatform        string
+	MsgGatewayStartAll        bool
+	MsgGatewayAPIAddr         string
+	MsgGatewayTelegramToken   string
+	MsgGatewayTelegramProxy   string
+	MsgGatewayQQAppID         string
+	MsgGatewayQQSandbox       bool
+	MsgGatewayWeixinAccountID string
+	MsgGatewayOpenClawAccount string
+	ChatTimeoutSeconds        int
+	ProgressAsMessages        bool
+	ProgressAsNaturalLanguage bool
+	ProgressSummaryWithLLM    bool
+	ProgressSummaryPrompt     string
+	ShowToolDetailsInResult   bool
+	DisableAutoReaction       bool
+	MaxConcurrentSessions     int
+	ToolTraceTemplates        map[string]string
+	MemoryTrace               bool
+	MemoryTraceLevel          string
+	MemoryTraceMaxResults     int
+	MemoryTraceMaxHops        int
+	ModelRouterEnabled        bool
+}
+
+// agentConfigSnapshot is retained as an in-package compatibility alias.
+type agentConfigSnapshot = AgentConfigSnapshot
+
+// ContextWindowSnapshot is the reduced context-window view used by commands.
+type ContextWindowSnapshot struct {
+	MaxTokens            int
+	ReservedTokens       int
+	Strategy             string
+	SlidingWindowSize    int
+	MaxConversationTurns int
+	MemoryBudget         int
+	SummarizeThreshold   float64
+}
+
+// contextWindowSnapshot is retained as an in-package compatibility alias.
+type contextWindowSnapshot = ContextWindowSnapshot
+
+// agentProviderAdapter 将 *agent.Agent 适配为 agentProvider 接口。
+type agentProviderAdapter struct {
+	inner *agent.Agent
+}
+
+func (a agentProviderAdapter) TaskStore() taskstore.Store      { return a.inner.TaskStore() }
+func (a agentProviderAdapter) Delegate() *tool.DelegateManager { return a.inner.Delegate() }
+
+func (a agentProviderAdapter) Sessions() *session.Manager {
+	return a.inner.Sessions()
+}
+
+func (a agentProviderAdapter) Config() agentConfigProvider {
+	return agentConfigWrapper{a.inner.Config()}
+}
+
+func (a agentProviderAdapter) SwitchModel(modelID string) error {
+	return a.inner.SwitchModel(modelID)
+}
+
+func (a agentProviderAdapter) SandboxMode() sandbox.Mode {
+	if a.inner == nil {
+		return sandbox.ModeDev
+	}
+	return a.inner.SandboxMode()
+}
+
+func (a agentProviderAdapter) SetSandboxMode(mode string) error {
+	if a.inner == nil {
+		return fmt.Errorf("sandbox controls are unavailable")
+	}
+	return a.inner.SetSandboxMode(mode)
+}
+
+func (a agentProviderAdapter) SwitchModelKind(kind config.ModelKind, modelID string, opts agent.SwitchModelOptions) error {
+	return a.inner.SwitchModelKind(kind, modelID, opts)
+}
+
+func (a agentProviderAdapter) CurrentModel(kind config.ModelKind) (agent.ModelRef, bool) {
+	return a.inner.CurrentModel(kind)
+}
+
+func (a agentProviderAdapter) ListModels(kind *config.ModelKind) []agent.ModelRef {
+	return a.inner.ListModels(kind)
+}
+
+func (a agentProviderAdapter) ModelProfiles() map[string]map[config.ModelKind]string {
+	return a.inner.ModelProfiles()
+}
+
+func (a agentProviderAdapter) ApplyModelProfile(name string) error {
+	return a.inner.ApplyModelProfile(name)
+}
+
+func (a agentProviderAdapter) Soul() *soul.Soul {
+	return a.inner.Soul()
+}
+
+func (a agentProviderAdapter) Tools() *tool.Registry {
+	return a.inner.Tools()
+}
+
+func (a agentProviderAdapter) Skills() []*tool.SkillInfo {
+	return a.inner.Skills()
+}
+
+func (a agentProviderAdapter) CronEngine() *cron.Engine {
+	return a.inner.CronEngine()
+}
+
+func (a agentProviderAdapter) Chat(ctx context.Context, userInput string) (string, error) {
+	return a.inner.Chat(ctx, userInput)
+}
+
+func (a agentProviderAdapter) ChatWithSession(ctx context.Context, sessionID, userInput string) (string, error) {
+	return a.inner.ChatWithSession(ctx, sessionID, userInput)
+}
+
+func (a agentProviderAdapter) ChatWithSessionInput(ctx context.Context, sessionID string, input agent.UserTurnInput) (string, error) {
+	return a.inner.ChatWithSessionInput(ctx, sessionID, input)
+}
+
+func (a agentProviderAdapter) ChatWithSessionTurn(ctx context.Context, sessionID string, input turn.Input) (string, error) {
+	return a.inner.ChatWithSessionTurn(ctx, sessionID, input)
+}
+
+func (a agentProviderAdapter) ChatWithSessionStream(ctx context.Context, sessionID, userInput string) (<-chan agent.ChatEvent, error) {
+	return a.inner.ChatWithSessionStream(ctx, sessionID, userInput)
+}
+
+func (a agentProviderAdapter) ChatWithSessionStreamInput(ctx context.Context, sessionID string, input agent.UserTurnInput) (<-chan agent.ChatEvent, error) {
+	return a.inner.ChatWithSessionStreamInput(ctx, sessionID, input)
+}
+
+func (a agentProviderAdapter) ChatWithSessionStreamTurn(ctx context.Context, sessionID string, input turn.Input) (<-chan agent.ChatEvent, error) {
+	return a.inner.ChatWithSessionStreamTurn(ctx, sessionID, input)
+}
+
+func (a agentProviderAdapter) ChatWithSessionStreamTurnEvents(ctx context.Context, sessionID string, input turn.Input) (<-chan turn.ChatEvent, error) {
+	return a.inner.ChatWithSessionStreamTurnEvents(ctx, sessionID, input)
+}
+
+func (a agentProviderAdapter) ProgressFeedback(ctx context.Context, userInput string, round int, observations []string) (string, error) {
+	return a.inner.ProgressFeedback(ctx, userInput, round, observations)
+}
+
+func (a agentProviderAdapter) ProgressFeedbackWithPrompt(ctx context.Context, userInput string, round int, observations []string, presentationPrompt string) (string, error) {
+	return a.inner.ProgressFeedbackWithPrompt(ctx, userInput, round, observations, presentationPrompt)
+}
+
+func (a agentProviderAdapter) Metrics() *metrics.Metrics {
+	return a.inner.Metrics()
+}
+
+func (a agentProviderAdapter) Memory() memory.Inspector {
+	return a.inner.Memory()
+}
+
+func (a agentProviderAdapter) Remember(content, category string) error {
+	return a.inner.Remember(content, category)
+}
+
+func (a agentProviderAdapter) RememberLongTerm(content, category string) error {
+	return a.inner.RememberLongTerm(content, category)
+}
+
+func (a agentProviderAdapter) Recall(query string) []memory.Entry {
+	return a.inner.Recall(query)
+}
+
+func (a agentProviderAdapter) MemoryStats() map[memory.Tier]int {
+	return a.inner.MemoryStats()
+}
+
+func (a agentProviderAdapter) DecayMemory(threshold float64) int {
+	return a.inner.DecayMemory(threshold)
+}
+
+func (a agentProviderAdapter) PromoteMemory(id string) error {
+	return a.inner.PromoteMemory(id)
+}
+
+func (a agentProviderAdapter) Catalog() *provider.ModelCatalog {
+	return a.inner.Catalog()
+}
+
+func (a agentProviderAdapter) RAG() *rag.RAGManager {
+	return a.inner.RAG()
+}
+
+func (a agentProviderAdapter) MCPAdmin() mcpclient.Admin {
+	return a.inner.MCPAdmin()
+}
+
+func (a agentProviderAdapter) ContextWindowConfig() contextWindowSnapshot {
+	cw := a.inner.ContextWindow()
+	if cw == nil {
+		return contextWindowSnapshot{}
+	}
+	cfg := cw.Config()
+	return contextWindowSnapshot{
+		MaxTokens:            cfg.MaxTokens,
+		ReservedTokens:       cfg.ReservedTokens,
+		Strategy:             cfg.Strategy.String(),
+		SlidingWindowSize:    cfg.SlidingWindowSize,
+		MaxConversationTurns: cfg.MaxConversationTurns,
+		MemoryBudget:         cfg.MemoryBudget,
+		SummarizeThreshold:   cfg.SummarizeThreshold,
+	}
+}
+
+func (a agentProviderAdapter) ContextCacheStats() map[string]any {
+	return a.inner.ContextCacheStats()
+}
+
+func (a agentProviderAdapter) EmbedderRegistry() *embedder.Registry {
+	return a.inner.EmbedderRegistry()
+}
+
+func (a agentProviderAdapter) ResolveExternalReplyAnchor(platform, chatID, messageID string) (string, bool) {
+	return a.inner.ResolveExternalReplyAnchor(platform, chatID, messageID)
+}
+
+func (a agentProviderAdapter) RecordRecentChatTarget(platform, chatID, replyToMsgID string) {
+	a.inner.RecordRecentChatTarget(platform, chatID, replyToMsgID)
+}
+
+// agentConfigWrapper 将 *config.Manager 适配为 agentConfigProvider 接口。
+type agentConfigWrapper struct {
+	mgr *config.Manager
+}
+
+func (w agentConfigWrapper) Get() agentConfigSnapshot {
+	cfg := w.mgr.Get()
+	return agentConfigSnapshot{
+		HomeDir:                   w.mgr.HomeDir(),
+		ConfigFile:                w.mgr.ConfigFile(),
+		Model:                     cfg.Model,
+		Provider:                  cfg.Provider,
+		APIKey:                    cfg.APIKey,
+		APIBase:                   cfg.APIBase,
+		ExtraHeaders:              cloneStringMap(cfg.ExtraHeaders),
+		CustomModels:              customModelInfos(cfg.CustomModels),
+		SoulPath:                  cfg.SoulPath,
+		MaxTokens:                 cfg.MaxTokens,
+		Temperature:               cfg.Temperature,
+		ServerAddr:                cfg.Server.Addr,
+		MsgGatewayPlatform:        cfg.MsgGateway.Platform,
+		MsgGatewayStartAll:        cfg.MsgGateway.StartAll,
+		MsgGatewayAPIAddr:         cfg.MsgGateway.APIAddr,
+		MsgGatewayTelegramToken:   cfg.MsgGateway.Telegram.Token,
+		MsgGatewayTelegramProxy:   cfg.MsgGateway.Telegram.Proxy,
+		MsgGatewayQQAppID:         cfg.MsgGateway.QQOfficial.AppID,
+		MsgGatewayQQSandbox:       cfg.MsgGateway.QQOfficial.Sandbox,
+		MsgGatewayWeixinAccountID: cfg.MsgGateway.Weixin.AccountID,
+		MsgGatewayOpenClawAccount: cfg.MsgGateway.OpenClawWeixin.AccountID,
+		ChatTimeoutSeconds:        cfg.MsgGateway.Telegram.ChatTimeoutSeconds,
+		ProgressAsMessages:        cfg.MsgGateway.Telegram.ProgressAsMessages,
+		ProgressAsNaturalLanguage: cfg.MsgGateway.Telegram.ProgressAsNaturalLanguage,
+		ProgressSummaryWithLLM:    cfg.MsgGateway.Telegram.ProgressSummaryWithLLM,
+		ProgressSummaryPrompt:     cfg.MsgGateway.Telegram.ProgressSummaryPrompt,
+		ShowToolDetailsInResult:   cfg.MsgGateway.Telegram.ShowToolDetailsInResult,
+		DisableAutoReaction:       cfg.MsgGateway.Telegram.DisableAutoReaction,
+		MaxConcurrentSessions:     cfg.MsgGateway.Telegram.MaxConcurrentSessions,
+		ToolTraceTemplates:        cfg.ToolTrace.Templates,
+		MemoryTrace:               cfg.MsgGateway.Telegram.MemoryTrace,
+		MemoryTraceLevel:          cfg.MsgGateway.Telegram.MemoryTraceLevel,
+		MemoryTraceMaxResults:     cfg.MsgGateway.Telegram.MemoryTraceMaxResults,
+		MemoryTraceMaxHops:        cfg.MsgGateway.Telegram.MemoryTraceMaxHops,
+		ModelRouterEnabled:        cfg.ModelRouter.Enable,
+	}
+}
+
+func (w agentConfigWrapper) Set(key, value string) error {
+	return w.mgr.Set(key, value)
+}
+
+func (w agentConfigWrapper) Save() error {
+	return w.mgr.Save()
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func customModelInfos(models []config.CustomModelInfo) []provider.ModelInfo {
+	if len(models) == 0 {
+		return nil
+	}
+	result := make([]provider.ModelInfo, 0, len(models))
+	for _, model := range models {
+		if strings.TrimSpace(model.ID) == "" {
+			continue
+		}
+		result = append(result, provider.ModelInfo{
+			ID:            model.ID,
+			Provider:      model.Provider,
+			DisplayName:   model.DisplayName,
+			Capabilities:  append([]string(nil), model.Capabilities...),
+			ContextWindow: model.ContextWindow,
+			CostPer1kIn:   model.CostPer1kIn,
+			CostPer1kOut:  model.CostPer1kOut,
+		})
+	}
+	return result
+}
+
+type telegramCommandHandler func(ctx context.Context, msg *gateway.Message) error
+
+// Handler processes Telegram bot commands and messages with per-chat session management.
+type Handler struct {
+	adapter  telegramSender
+	mcpAdmin mcpclient.Admin
+	agent    agentProvider
+	chat     chatRuntime
+	state    stateRuntime
+	recorder activeRouteRecorder
+	commands map[string]telegramCommandHandler
+	watcher  *cron.Watcher
+
+	mu                sync.RWMutex
+	sessions          map[string]string // chatID → sessionID
+	tasks             map[string]*chatTask
+	queues            map[string]*chatQueue
+	chatWorkerSlots   chan struct{}
+	lucky             *luckycollector.Lucky
+	restarting        bool
+	delegateChats     map[string]string
+	delegateTrackers  map[string]*delegateProgressTracker
+	delegateTaskChats map[string]string
+	workerWG          sync.WaitGroup
+	workerGeneration  uint64
+
+	// v0.44.0: chatID→sessionID 映射持久化
+	dataDir string
+
+	// 对话总超时（防止长任务无限占用）；可配置，默认 10 分钟
+	chatStreamTimeout time.Duration
+	// 中间思考/工具步骤是否作为独立消息发送
+	progressAsMessages bool
+	// 中间步骤是否转成自然语言进度播报，并在最后统一输出结论
+	progressAsNaturalLanguage bool
+	// 每轮未完成时是否发送一条由 LLM 生成的总结性反馈
+	progressSummaryWithLLM bool
+	// Reasoning Trace 进度摘要的展示提示词；为空使用 Agent 内置默认值
+	progressSummaryPrompt string
+	// 最终回答前是否附上自然语言工具摘要
+	showToolDetailsInResult bool
+	// 是否关闭群聊请求确认表情
+	disableAutoReaction   bool
+	toolTraceTemplates    map[string]string
+	memoryTrace           bool
+	memoryTraceLevel      string
+	memoryTraceMaxResults int
+	memoryTraceMaxHops    int
+	modelDiscovery        *provider.ModelDiscovery
+
+	memeDir         string
+	memeProbability float64
+	memeCooldown    time.Duration
+	memeRand        *rand.Rand
+	memeNow         func() time.Time
+	memeLastSent    map[string]time.Time
+}
+
+type chatTask struct {
+	cancel context.CancelFunc
+}
+
+type queuedChatRequest struct {
+	ctx   context.Context
+	msg   *gateway.Message
+	input agent.UserTurnInput
+}
+
+type chatQueue struct {
+	running    bool
+	generation uint64
+	items      []*queuedChatRequest
+}
+
+const defaultChatStreamTimeout = 10 * time.Minute
+
+// chatSessionsData 是持久化的 chatID→sessionID 映射
+type chatSessionsData struct {
+	ChatSessions map[string]string `json:"chat_sessions"`
+}
+
+// NewHandler creates a new Telegram command handler.
+func NewHandler(adapter *Adapter, a *agent.Agent) *Handler {
+	return newHandler(adapter, NewRuntime(a), a)
+}
+
+// NewRuntime adapts the legacy Agent to the gateway runtime contract. Keep
+// this conversion at the assembly boundary while handlers consume Runtime.
+func NewRuntime(a *agent.Agent) Runtime {
+	if a == nil {
+		return nil
+	}
+	return agentProviderAdapter{a}
+}
+
+// NewHandlerWithRuntime creates a Telegram handler from the gateway runtime
+// contract. It lets embedding applications provide a focused runtime without
+// exposing the concrete agent.Agent to gateway assembly code.
+func NewHandlerWithRuntime(adapter *Adapter, runtime Runtime) *Handler {
+	var recorder activeRouteRecorder
+	if candidate, ok := runtime.(activeRouteRecorder); ok {
+		recorder = candidate
+	}
+	return newHandler(adapter, runtime, recorder)
+}
+
+func newHandler(adapter *Adapter, runtime Runtime, recorder activeRouteRecorder) *Handler {
+	var chat chatRuntime
+	var state stateRuntime
+	var mcpAdmin mcpclient.Admin
+	if source, ok := runtime.(interface{ MCPAdmin() mcpclient.Admin }); ok {
+		mcpAdmin = source.MCPAdmin()
+	}
+	if runtime != nil {
+		chat = runtime
+		state = runtime
+	}
+	memeDir, memeProbability, memeCooldown := resolveRandomMemeConfig()
+	maxConcurrentChatWorkers := resolveMaxConcurrentChatWorkers(state)
+	h := &Handler{
+		adapter:                   adapter,
+		mcpAdmin:                  mcpAdmin,
+		agent:                     runtime,
+		chat:                      chat,
+		state:                     state,
+		recorder:                  recorder,
+		commands:                  make(map[string]telegramCommandHandler),
+		watcher:                   cron.NewWatcher(resolveCronEngine(state)),
+		sessions:                  make(map[string]string),
+		tasks:                     make(map[string]*chatTask),
+		queues:                    make(map[string]*chatQueue),
+		chatWorkerSlots:           make(chan struct{}, maxConcurrentChatWorkers),
+		lucky:                     luckycollector.NewLucky(),
+		dataDir:                   "", // 默认不持久化，需 SetDataDir 启用
+		chatStreamTimeout:         resolveChatStreamTimeout(state),
+		progressAsMessages:        resolveProgressAsMessages(state),
+		progressAsNaturalLanguage: resolveProgressAsNaturalLanguage(state),
+		progressSummaryWithLLM:    resolveProgressSummaryWithLLM(state),
+		progressSummaryPrompt:     resolveProgressSummaryPrompt(state),
+		showToolDetailsInResult:   resolveShowToolDetailsInResult(state),
+		disableAutoReaction:       resolveDisableAutoReaction(state),
+		toolTraceTemplates:        resolveToolTraceTemplates(state),
+		memoryTrace:               resolveMemoryTrace(state),
+		memoryTraceLevel:          resolveMemoryTraceLevel(state),
+		memoryTraceMaxResults:     resolveMemoryTraceMaxResults(state),
+		memoryTraceMaxHops:        resolveMemoryTraceMaxHops(state),
+		modelDiscovery:            provider.NewModelDiscovery(),
+		memeDir:                   memeDir,
+		memeProbability:           memeProbability,
+		memeCooldown:              memeCooldown,
+		memeRand:                  rand.New(rand.NewSource(time.Now().UnixNano())),
+		memeNow:                   time.Now,
+		memeLastSent:              make(map[string]time.Time),
+		delegateChats:             make(map[string]string),
+		delegateTrackers:          make(map[string]*delegateProgressTracker),
+		delegateTaskChats:         make(map[string]string),
+	}
+	h.commands = h.buildCommandRegistry()
+	adapter.SetCallbackHandler(h.handleDelegateCallback)
+	return h
+}
+
+func (h *Handler) buildCommandRegistry() map[string]telegramCommandHandler {
+	handlers := map[string]telegramCommandHandler{
+		"start":   h.handleStart,
+		"help":    h.handleHelp,
+		"review":  h.handleReview,
+		"init":    h.handleInit,
+		"config":  h.handleConfig,
+		"version": h.handleVersion,
+		"set":     h.handleSetSandbox,
+		"model":   h.handleModel,
+		"models":  h.handleModels,
+		"soul":    h.handleSoul,
+		"tools":   h.handleTools,
+		"tool":    h.handleTool,
+		"reset":   h.handleReset,
+		"history": h.handleHistory,
+		"session": h.handleSession,
+		"chat": func(ctx context.Context, msg *gateway.Message) error {
+			return h.dispatchChatAsync(ctx, msg, agent.TextUserTurnInput(msg.Args))
+		},
+		"lucky":         h.handleLucky,
+		"sessions":      h.handleSessions,
+		"resume":        h.handleResume,
+		"rename":        h.handleRename,
+		"skills":        h.handleSkills,
+		"skill":         h.handleSkill,
+		"mcp":           h.handleMCP,
+		"approve":       h.handleApprove,
+		"deny":          h.handleDeny,
+		"cron":          h.handleCron,
+		"watch":         h.handleWatch,
+		"msg_gateway":   h.handleMsgGateway,
+		"rag":           h.handleRAG,
+		"context":       h.handleContext,
+		"fc":            h.handleFC,
+		"embedder":      h.handleEmbedder,
+		"metrics":       h.handleMetrics,
+		"health":        h.handleHealth,
+		"remember":      h.handleRemember,
+		"remember_long": h.handleRememberLong,
+		"recall":        h.handleRecall,
+		"memstats":      h.handleMemStats,
+		"memdecay":      h.handleMemDecay,
+		"promote":       h.handlePromote,
+		"profile":       h.handleProfile,
+		"new":           h.handleNew,
+		"stop":          h.handleStop,
+		"status":        h.handleStatus,
+		"restart":       h.handleRestart,
+	}
+	registry := make(map[string]telegramCommandHandler, len(handlers))
+	for _, name := range telegramCommandNames() {
+		if handler, ok := handlers[name]; ok {
+			registry[name] = handler
+		}
+	}
+	return registry
+}
+
+func resolveRandomMemeConfig() (string, float64, time.Duration) {
+	dir := strings.TrimSpace(os.Getenv("LH_TG_MEME_DIR"))
+	if dir == "" {
+		if wd, err := os.Getwd(); err == nil {
+			for _, candidate := range []string{
+				filepath.Join(wd, "assets", "memes"),
+				filepath.Join(wd, "memes"),
+			} {
+				if st, err := os.Stat(candidate); err == nil && st.IsDir() {
+					dir = candidate
+					break
+				}
+			}
+		}
+	}
+
+	probability := 0.30
+	if raw := strings.TrimSpace(os.Getenv("LH_TG_MEME_PROBABILITY")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v >= 0 && v <= 1 {
+			probability = v
+		}
+	}
+
+	cooldown := 5 * time.Minute
+	if raw := strings.TrimSpace(os.Getenv("LH_TG_MEME_COOLDOWN_SECONDS")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			cooldown = time.Duration(v) * time.Second
+		}
+	}
+
+	return dir, probability, cooldown
+}
+
+func resolveChatStreamTimeout(state stateRuntime) time.Duration {
+	timeout := defaultChatStreamTimeout
+	if state == nil {
+		return timeout
+	}
+	cfg := state.Config().Get()
+	if cfg.ChatTimeoutSeconds > 0 {
+		timeout = time.Duration(cfg.ChatTimeoutSeconds) * time.Second
+	}
+	if timeout <= 0 {
+		timeout = defaultChatStreamTimeout
+	}
+	return timeout
+}
+
+func resolveCronEngine(state stateRuntime) *cron.Engine {
+	if state != nil {
+		if engine := state.CronEngine(); engine != nil {
+			return engine
+		}
+	}
+	return cron.NewEngine()
+}
+
+func resolveProgressAsMessages(state stateRuntime) bool {
+	enabled := true
+	if state == nil {
+		return enabled
+	}
+	cfg := state.Config().Get()
+	return cfg.ProgressAsMessages
+}
+
+func resolveProgressAsNaturalLanguage(state stateRuntime) bool {
+	if state == nil {
+		return false
+	}
+	cfg := state.Config().Get()
+	return cfg.ProgressAsNaturalLanguage
+}
+
+func resolveProgressSummaryWithLLM(state stateRuntime) bool {
+	if state == nil {
+		return false
+	}
+	cfg := state.Config().Get()
+	return cfg.ProgressSummaryWithLLM
+}
+
+func resolveProgressSummaryPrompt(state stateRuntime) string {
+	if state == nil {
+		return ""
+	}
+	return strings.TrimSpace(state.Config().Get().ProgressSummaryPrompt)
+}
+
+func resolveShowToolDetailsInResult(state stateRuntime) bool {
+	if state == nil {
+		return false
+	}
+	cfg := state.Config().Get()
+	return cfg.ShowToolDetailsInResult
+}
+
+func resolveDisableAutoReaction(state stateRuntime) bool {
+	if state == nil {
+		return false
+	}
+	return state.Config().Get().DisableAutoReaction
+}
+
+func resolveMaxConcurrentChatWorkers(state stateRuntime) int {
+	const defaultMaxConcurrentChatWorkers = 8
+	if state == nil {
+		return defaultMaxConcurrentChatWorkers
+	}
+	if configured := state.Config().Get().MaxConcurrentSessions; configured > 0 {
+		return configured
+	}
+	return defaultMaxConcurrentChatWorkers
+}
+
+func resolveToolTraceTemplates(state stateRuntime) map[string]string {
+	if state == nil {
+		return nil
+	}
+	configured := state.Config().Get().ToolTraceTemplates
+	if len(configured) == 0 {
+		return nil
+	}
+	templates := make(map[string]string, len(configured))
+	for name, annotation := range configured {
+		templates[name] = annotation
+	}
+	return templates
+}
+
+func resolveMemoryTrace(state stateRuntime) bool {
+	if state == nil {
+		return true
+	}
+	cfg := state.Config().Get()
+	return cfg.MemoryTrace
+}
+
+func resolveMemoryTraceLevel(state stateRuntime) string {
+	if state == nil {
+		return "summary"
+	}
+	level := strings.ToLower(strings.TrimSpace(state.Config().Get().MemoryTraceLevel))
+	if level == "" {
+		return "summary"
+	}
+	return level
+}
+
+func resolveMemoryTraceMaxResults(state stateRuntime) int {
+	if state == nil {
+		return 6
+	}
+	if n := state.Config().Get().MemoryTraceMaxResults; n > 0 {
+		return n
+	}
+	return 6
+}
+
+func resolveMemoryTraceMaxHops(state stateRuntime) int {
+	if state == nil {
+		return 8
+	}
+	if n := state.Config().Get().MemoryTraceMaxHops; n > 0 {
+		return n
+	}
+	return 8
+}
+
+func (h *Handler) sessionManager() *session.Manager {
+	if h == nil {
+		return nil
+	}
+	if h.state != nil {
+		return h.state.Sessions()
+	}
+	if h.agent != nil {
+		return h.agent.Sessions()
+	}
+	return nil
+}
+
+func (h *Handler) chatService() chatRuntime {
+	if h == nil {
+		return nil
+	}
+	if h.chat != nil {
+		return h.chat
+	}
+	if h.agent != nil {
+		return h.agent
+	}
+	return nil
+}
+
+func (h *Handler) stateService() stateRuntime {
+	if h == nil {
+		return nil
+	}
+	if h.state != nil {
+		return h.state
+	}
+	if h.agent != nil {
+		return h.agent
+	}
+	return nil
+}
+
+func (h *Handler) routeRecorder() activeRouteRecorder {
+	if h == nil {
+		return nil
+	}
+	if h.recorder != nil {
+		return h.recorder
+	}
+	if h.agent != nil {
+		if recorder, ok := any(h.agent).(activeRouteRecorder); ok {
+			return recorder
+		}
+	}
+	return nil
+}
+
+func (h *Handler) replyAnchorResolver() replyAnchorResolver {
+	if h == nil {
+		return nil
+	}
+	if h.agent != nil {
+		if resolver, ok := h.agent.(replyAnchorResolver); ok {
+			return resolver
+		}
+	}
+	return nil
+}
+
+func (h *Handler) tools() *tool.Registry {
+	state := h.stateService()
+	if state == nil {
+		return nil
+	}
+	return state.Tools()
+}
+
+func (h *Handler) metricsCollector() *metrics.Metrics {
+	state := h.stateService()
+	if state == nil {
+		return nil
+	}
+	return state.Metrics()
+}
+
+func (h *Handler) memoryStore() memory.Inspector {
+	state := h.stateService()
+	if state == nil {
+		return nil
+	}
+	return state.Memory()
+}
+
+func (h *Handler) cronEngine() *cron.Engine {
+	state := h.stateService()
+	return resolveCronEngine(state)
+}
+
+func (h *Handler) watcherService() *cron.Watcher {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.watcher == nil {
+		h.watcher = cron.NewWatcher(resolveCronEngine(h.stateService()))
+	}
+	return h.watcher
+}
+
+func (h *Handler) skillsList() []*tool.SkillInfo {
+	state := h.stateService()
+	if state == nil {
+		return nil
+	}
+	return state.Skills()
+}
+
+func (h *Handler) configSnapshot() agentConfigSnapshot {
+	state := h.stateService()
+	if state == nil {
+		return agentConfigSnapshot{}
+	}
+	return state.Config().Get()
+}
+
+func (h *Handler) effectiveChatStreamTimeout() time.Duration {
+	if h.chatStreamTimeout > 0 {
+		return h.chatStreamTimeout
+	}
+	return defaultChatStreamTimeout
+}
+
+func (h *Handler) effectiveProgressAsMessages() bool {
+	return h.progressAsMessages
+}
+
+func (h *Handler) effectiveProgressAsNaturalLanguage() bool {
+	return h.progressAsNaturalLanguage
+}
+
+func (h *Handler) effectiveProgressSummaryWithLLM() bool {
+	return h.progressSummaryWithLLM
+}
+
+func (h *Handler) effectiveProgressSummaryPrompt() string {
+	if state := h.stateService(); state != nil {
+		return strings.TrimSpace(state.Config().Get().ProgressSummaryPrompt)
+	}
+	return strings.TrimSpace(h.progressSummaryPrompt)
+}
+
+func (h *Handler) effectiveShowToolDetailsInResult() bool {
+	return h.showToolDetailsInResult
+}
+
+func (h *Handler) effectiveMemoryTrace() bool {
+	return h.memoryTrace
+}
+
+func (h *Handler) effectiveMemoryTraceLevel() string {
+	level := strings.ToLower(strings.TrimSpace(h.memoryTraceLevel))
+	if level == "" {
+		return "summary"
+	}
+	return level
+}
+
+func (h *Handler) effectiveMemoryTraceMaxResults() int {
+	if h.memoryTraceMaxResults > 0 {
+		return h.memoryTraceMaxResults
+	}
+	return 6
+}
+
+func (h *Handler) effectiveMemoryTraceMaxHops() int {
+	if h.memoryTraceMaxHops > 0 {
+		return h.memoryTraceMaxHops
+	}
+	return 8
+}
+
+const telegramMemoryTraceEventName = "__memory_trace"
+
+func (h *Handler) sendMemoryTraceCards(msg *gateway.Message, traces []memory.SearchTrace) {
+	if !h.effectiveMemoryTrace() || len(traces) == 0 {
+		return
+	}
+	for _, trace := range traces {
+		card := presentation.RenderTelegramMemoryTraceCard(
+			trace,
+			h.effectiveMemoryTraceLevel(),
+			h.effectiveMemoryTraceMaxResults(),
+			h.effectiveMemoryTraceMaxHops(),
+		)
+		if strings.TrimSpace(card) == "" {
+			continue
+		}
+		h.sendProgressMessageHTML(msg, card)
+	}
+}
+
+func shouldPrependToolNarratives(showToolDetails, narrativeMode bool) bool {
+	return showToolDetails && !narrativeMode
+}
+
+// SetDataDir 设置数据目录并从磁盘恢复 chatID→sessionID 映射
+func (h *Handler) SetDataDir(dir string) {
+	h.mu.Lock()
+	h.dataDir = dir
+	h.mu.Unlock()
+
+	// 确保目录存在
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		fmt.Printf("[telegram] warning: failed to create data dir %s: %v\n", dir, err)
+		return
+	}
+
+	// 从磁盘恢复映射
+	h.loadChatSessions()
+}
+
+// chatSessionsPath 返回持久化文件路径
+func (h *Handler) chatSessionsPath() string {
+	if h.dataDir == "" {
+		return ""
+	}
+	return filepath.Join(h.dataDir, "chat_sessions.json")
+}
+
+// loadChatSessions 从磁盘加载 chatID→sessionID 映射
+func (h *Handler) loadChatSessions() {
+	path := h.chatSessionsPath()
+	if path == "" {
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// 文件不存在是正常的
+		return
+	}
+
+	var csd chatSessionsData
+	if err := json.Unmarshal(data, &csd); err != nil {
+		fmt.Printf("[telegram] warning: failed to parse chat_sessions.json: %v\n", err)
+		return
+	}
+
+	h.mu.Lock()
+	for chatID, sessionID := range csd.ChatSessions {
+		sessions := h.sessionManager()
+		if sessions == nil {
+			continue
+		}
+		if _, ok := sessions.Get(sessionID); ok {
+			h.sessions[chatID] = sessionID
+		}
+	}
+	h.mu.Unlock()
+
+	fmt.Printf("[telegram] restored %d chat→session mappings from disk\n", len(h.sessions))
+}
+
+// saveChatSessions 持久化 chatID→sessionID 映射到磁盘
+func (h *Handler) saveChatSessions() {
+	path := h.chatSessionsPath()
+	if path == "" {
+		return
+	}
+
+	h.mu.RLock()
+	csd := chatSessionsData{
+		ChatSessions: make(map[string]string, len(h.sessions)),
+	}
+	for k, v := range h.sessions {
+		csd.ChatSessions[k] = v
+	}
+	h.mu.RUnlock()
+
+	data, err := json.MarshalIndent(csd, "", "  ")
+	if err != nil {
+		fmt.Printf("[telegram] warning: failed to marshal chat_sessions: %v\n", err)
+		return
+	}
+
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		fmt.Printf("[telegram] warning: failed to write chat_sessions.json: %v\n", err)
+	}
+}
+
+// getSessionID returns the session ID for a chat, creating one if needed.
+func (h *Handler) getSessionID(chatID string) string {
+	h.mu.RLock()
+	if sid, ok := h.sessions[chatID]; ok {
+		h.mu.RUnlock()
+		return sid
+	}
+	h.mu.RUnlock()
+
+	// Create new session via agent
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return ""
+	}
+	sess := sessions.New()
+	h.mu.Lock()
+	h.sessions[chatID] = sess.ID
+	h.mu.Unlock()
+	h.saveChatSessions()
+	return sess.ID
+}
+
+// resetSession creates a new session for the chat, discarding the old one.
+func (h *Handler) resetSession(chatID string) string {
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return ""
+	}
+	sess := sessions.New()
+	h.mu.Lock()
+	h.sessions[chatID] = sess.ID
+	h.mu.Unlock()
+	h.saveChatSessions()
+	return sess.ID
+}
+
+// hasSession checks if a chat already has an assigned session.
+func (h *Handler) hasSession(chatID string) bool {
+	h.mu.RLock()
+	_, ok := h.sessions[chatID]
+	h.mu.RUnlock()
+	return ok
+}
+
+// setSessionID directly sets the session ID for a chat (for testing).
+func (h *Handler) setSessionID(chatID, sessionID string) {
+	h.mu.Lock()
+	h.sessions[chatID] = sessionID
+	h.mu.Unlock()
+}
+
+func (h *Handler) currentSessionID(chatID string) string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.sessions[chatID]
+}
+
+func (h *Handler) bindSessionID(chatID, sessionID string) {
+	chatID = strings.TrimSpace(chatID)
+	sessionID = strings.TrimSpace(sessionID)
+	if chatID == "" || sessionID == "" {
+		return
+	}
+	h.mu.Lock()
+	h.sessions[chatID] = sessionID
+	h.mu.Unlock()
+	h.saveChatSessions()
+}
+
+func shortSessionID(id string) string {
+	id = strings.TrimSpace(id)
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+func truncateForTelegramList(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if limit <= 0 || len(runes) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-3]) + "..."
+}
+
+func valueOrUnset(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "(unset)"
+	}
+	return value
+}
+
+func maskSecret(secret string) string {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return "(unset)"
+	}
+	if len(secret) <= 8 {
+		return "***"
+	}
+	return secret[:8] + "..."
+}
+
+func telegramSessionInfoByID(sessions *session.Manager, id string) (session.SessionInfo, bool) {
+	if sessions == nil {
+		return session.SessionInfo{}, false
+	}
+	for _, info := range sessions.ListInfo() {
+		if info.ID == id {
+			return info, true
+		}
+	}
+	return session.SessionInfo{}, false
+}
+
+func formatAmbiguousSessionSwitchMessage(query string, matches []session.SessionInfo) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("❌ 多个会话匹配 <code>%s</code>：\n\n", presentation.EscapeTelegramCommandHTML(query)))
+	limit := min(len(matches), 5)
+	for i := 0; i < limit; i++ {
+		sb.WriteString(fmt.Sprintf("• <code>%s</code> — %s（%d 条消息）\n",
+			presentation.EscapeTelegramCommandHTML(matches[i].ID),
+			presentation.EscapeTelegramCommandHTML(telegramSessionDisplayTitle(matches[i].Title)),
+			matches[i].MessageCount,
+		))
+	}
+	if len(matches) > limit {
+		sb.WriteString(fmt.Sprintf("\n… 还有 %d 个匹配会话", len(matches)-limit))
+	}
+	sb.WriteString("\n\n使用 <code>/resume &lt;ID&gt;</code> 切换。")
+	return sb.String()
+}
+
+func (h *Handler) dispatchChatAsync(ctx context.Context, msg *gateway.Message, input agent.UserTurnInput) error {
+	input = h.inputWithMessageScope(input, msg)
+	msgCopy := *msg
+	scope := telegramConversationScope(msg)
+	position, startWorker, generation := h.enqueueChatRequestWithGeneration(scope, &queuedChatRequest{
+		ctx:   ctx,
+		msg:   &msgCopy,
+		input: input,
+	})
+	if position == 0 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "ℹ️ Bot 正在重启中，请稍候")
+	}
+	if startWorker {
+		h.mu.Lock()
+		launch := !h.restarting && h.workerGeneration == generation
+		if launch {
+			h.workerWG.Add(1)
+		}
+		h.mu.Unlock()
+		if launch {
+			go h.runChatQueueGeneration(scope, generation)
+		}
+	}
+	if position > 1 {
+		h.notifyQueued(msg.Chat.ID, msg.ID, position-1)
+	}
+	return nil
+}
+
+func (h *Handler) enqueueChatRequest(chatID string, req *queuedChatRequest) (int, bool) {
+	position, start, _ := h.enqueueChatRequestWithGeneration(chatID, req)
+	return position, start
+}
+
+func (h *Handler) enqueueChatRequestWithGeneration(chatID string, req *queuedChatRequest) (position int, startWorker bool, generation uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.restarting {
+		return 0, false, h.workerGeneration
+	}
+	generation = h.workerGeneration
+
+	if h.queues == nil {
+		h.queues = make(map[string]*chatQueue)
+	}
+	q := h.queues[chatID]
+	if q == nil {
+		q = &chatQueue{generation: generation}
+		h.queues[chatID] = q
+	}
+
+	position = len(q.items) + 1
+	if h.tasks != nil && h.tasks[chatID] != nil {
+		position++
+	}
+	q.items = append(q.items, req)
+	if !q.running {
+		q.running = true
+		startWorker = true
+	}
+	return position, startWorker, generation
+}
+
+func (h *Handler) dequeueChatRequest(chatID string) (*queuedChatRequest, bool) {
+	h.mu.RLock()
+	q := h.queues[chatID]
+	gen := h.workerGeneration
+	if q != nil {
+		gen = q.generation
+	}
+	h.mu.RUnlock()
+	return h.dequeueChatRequestGeneration(chatID, gen)
+}
+
+func (h *Handler) dequeueChatRequestGeneration(chatID string, generation uint64) (*queuedChatRequest, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if generation != h.workerGeneration {
+		return nil, false
+	}
+
+	q := h.queues[chatID]
+	if q == nil || len(q.items) == 0 {
+		if q != nil {
+			q.running = false
+			delete(h.queues, chatID)
+		}
+		return nil, false
+	}
+
+	req := q.items[0]
+	q.items = q.items[1:]
+	return req, true
+}
+
+func (h *Handler) runChatQueue(chatID string) {
+	h.mu.RLock()
+	q := h.queues[chatID]
+	generation := h.workerGeneration
+	if q != nil {
+		generation = q.generation
+	}
+	h.mu.RUnlock()
+	h.runChatQueueGeneration(chatID, generation)
+}
+
+func (h *Handler) runChatQueueGeneration(chatID string, generation uint64) {
+	defer h.workerWG.Done()
+	release := h.acquireChatWorkerSlot()
+	defer release()
+
+	for {
+		req, ok := h.dequeueChatRequestGeneration(chatID, generation)
+		if !ok {
+			return
+		}
+		if err := h.handleChat(req.ctx, req.msg, req.input); err != nil {
+			fmt.Printf("[telegram] chat error: %v\n", err)
+		}
+	}
+}
+
+func (h *Handler) acquireChatWorkerSlot() func() {
+	if h == nil || h.chatWorkerSlots == nil {
+		return func() {}
+	}
+	h.chatWorkerSlots <- struct{}{}
+	return func() {
+		<-h.chatWorkerSlots
+	}
+}
+
+func (h *Handler) notifyQueued(chatID string, replyToMsgID string, ahead int) {
+	if h.adapter == nil || ahead <= 0 {
+		return
+	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	text := fmt.Sprintf("⏳ 已加入消息队列，前面还有 %d 个任务", ahead)
+	if strings.TrimSpace(replyToMsgID) != "" {
+		_ = h.adapter.SendWithReply(sendCtx, chatID, replyToMsgID, text)
+		return
+	}
+	_ = h.adapter.Send(sendCtx, chatID, text)
+}
+
+func (h *Handler) beginChatTask(chatID string, parent context.Context) (context.Context, *chatTask) {
+	h.mu.Lock()
+	if h.tasks == nil {
+		h.tasks = make(map[string]*chatTask)
+	}
+	taskCtx, cancel := context.WithCancel(parent)
+	task := &chatTask{cancel: cancel}
+	h.tasks[chatID] = task
+	h.mu.Unlock()
+	return taskCtx, task
+}
+
+func (h *Handler) finishChatTask(chatID string, task *chatTask) {
+	if task == nil {
+		return
+	}
+	h.mu.Lock()
+	if cur, ok := h.tasks[chatID]; ok && cur == task {
+		delete(h.tasks, chatID)
+	}
+	h.mu.Unlock()
+	task.cancel()
+}
+
+func (h *Handler) cancelChatTask(chatID string) bool {
+	h.mu.Lock()
+	if h.tasks == nil {
+		h.mu.Unlock()
+		return false
+	}
+	task, ok := h.tasks[chatID]
+	if ok {
+		delete(h.tasks, chatID)
+	}
+	h.mu.Unlock()
+	if !ok || task == nil {
+		return false
+	}
+	task.cancel()
+	return true
+}
+
+// cancelAllChatTasks cancels every in-flight chat task and drops queued work.
+// Used by /restart so a gateway bounce does not leave orphaned goroutines.
+func (h *Handler) cancelAllChatTasks() int {
+	cancelled, _ := h.cancelAllChatTasksAndWait()
+	return cancelled
+}
+
+func (h *Handler) cancelAllChatTasksAndWait() (int, bool) {
+	h.mu.Lock()
+	h.workerGeneration++
+	tasks := h.tasks
+	h.tasks = make(map[string]*chatTask)
+	h.queues = make(map[string]*chatQueue)
+	h.mu.Unlock()
+
+	cancelled := 0
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		task.cancel()
+		cancelled++
+	}
+	done := make(chan struct{})
+	go func() { h.workerWG.Wait(); close(done) }()
+	select {
+	case <-done:
+		return cancelled, true
+	case <-time.After(5 * time.Second):
+		fmt.Printf("[telegram] timed out waiting for chat workers\n")
+		return cancelled, false
+	}
+}
+
+func (h *Handler) restartAdminGate(ctx context.Context, msg *gateway.Message) error {
+	if msg == nil {
+		return nil
+	}
+	// Prefer adapter-local AdminIDs when the concrete Telegram adapter is used.
+	if adapter, ok := h.adapter.(*Adapter); ok {
+		if len(adapter.Config().AdminIDs) == 0 {
+			return nil // no admin list configured → allow (backward compatible)
+		}
+		if adapter.Config().IsAdmin(msg.Sender.ID) {
+			return nil
+		}
+		_ = h.adapter.Send(ctx, msg.Chat.ID, "⛔ /restart 仅管理员可用")
+		return fmt.Errorf("restart requires administrator")
+	}
+	return nil
+}
+
+func (h *Handler) queueStatus(chatID string) (running bool, queued int) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if task := h.tasks[chatID]; task != nil {
+		running = true
+	}
+	if q := h.queues[chatID]; q != nil {
+		queued = len(q.items)
+	}
+	return running, queued
+}
+
+func (h *Handler) luckyCollector() *luckycollector.Lucky {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.lucky == nil {
+		h.lucky = luckycollector.NewLucky()
+	}
+	return h.lucky
+}
+
+func (h *Handler) collectLuckyMessageIfActive(ctx context.Context, msg *gateway.Message) (bool, error) {
+	if msg == nil {
+		return false, nil
+	}
+	collector := h.luckyCollector()
+	key := luckycollector.KeyForMessage("telegram", msg)
+	status := collector.Status(key)
+	if !status.Active {
+		return false, nil
+	}
+	h.bindSessionFromReplyAnchor(msg)
+	status, err := collector.Append(key, msg)
+	if err != nil {
+		return true, h.sendLuckyNotice(ctx, msg, fmt.Sprintf("Lucky collection failed: %s", err.Error()))
+	}
+	return true, h.sendLuckyNotice(ctx, msg, fmt.Sprintf("已收集第 %d 段（附件 %d 个）。发送 /lucky off 提交，/lucky cancel 放弃。", status.SegmentCount, status.AttachmentCount))
+}
+
+func (h *Handler) sendLuckyNotice(ctx context.Context, msg *gateway.Message, text string) error {
+	if h == nil || h.adapter == nil || msg == nil {
+		return nil
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+		return h.adapter.SendWithReply(ctx, msg.Chat.ID, msg.ID, text)
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, text)
+}
+
+func isTaskCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context canceled")
+}
+
+func isTaskTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "context deadline exceeded")
+}
+
+func telegramChatErrorFeedback(err error) string {
+	if err == nil {
+		return "❌ 请求失败，请稍后重试。"
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(lower, "billing_error"),
+		strings.Contains(lower, "insufficient balance"),
+		strings.Contains(lower, "insufficient funds"),
+		strings.Contains(lower, "subscription"):
+		return "❌ 模型服务余额不足或订阅不可用，请检查余额/订阅后重试。"
+	case strings.Contains(lower, "invalid api key"),
+		strings.Contains(lower, "incorrect api key"),
+		strings.Contains(lower, "unauthorized"),
+		strings.Contains(lower, "authentication"):
+		return "❌ 模型服务认证失败，请检查 API Key 和服务地址后重试。"
+	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "too many requests"), strings.Contains(lower, "429"):
+		return "❌ 模型服务请求过于频繁，请稍等片刻后重试。"
+	case strings.Contains(lower, "protocol_not_supported"),
+		strings.Contains(lower, "does not support chat completions"),
+		strings.Contains(lower, "不支持 chat completions"):
+		return "❌ 模型协议不匹配：该模型需要 Responses API。请将 `protocol` 设为 `responses` 后重试。"
+	case isTaskTimeoutError(err):
+		return "⏱ 请求超时。任务可能太复杂或工具执行缓慢；可分解任务，或调整 `msg_gateway.telegram.chat_timeout_seconds` / `agent.timeout_seconds`。"
+	default:
+		return "❌ 请求失败：" + utils.TruncateKeepLength(err.Error(), 200)
+	}
+}
+
+func (h *Handler) telegramTimeoutFeedback(err error) string {
+	if h != nil && h.state != nil {
+		cfg := h.state.Config().Get()
+		if strings.TrimSpace(cfg.HomeDir) != "" {
+			_ = gateway.WriteTimeoutEvent(cfg.HomeDir, gateway.TimeoutEvent{
+				Layer:             "Telegram Gateway Chat",
+				ConfigPath:        "msg_gateway.telegram.chat_timeout_seconds",
+				ConfiguredSeconds: cfg.ChatTimeoutSeconds,
+				Error:             utils.TruncateKeepLength(fmt.Sprint(err), 200),
+			})
+		}
+	}
+	return telegramChatErrorFeedback(err)
+}
+
+// HandleMessage processes an incoming gateway message.
+func (h *Handler) HandleMessage(ctx context.Context, msg *gateway.Message) error {
+	if msg == nil {
+		return nil
+	}
+	// Channel posts are broadcast content rather than user prompts. Confirm
+	// receipt with a reaction without submitting every post to the agent.
+	if msg.Chat.Type == gateway.ChatChannel {
+		h.reactToIncomingMessage(msg)
+		return nil
+	}
+	if msg.IsCommand {
+		return h.handleCommand(ctx, msg)
+	}
+
+	msg.Attachments = telegramTurnAttachments(msg)
+	if collected, err := h.collectLuckyMessageIfActive(ctx, msg); collected || err != nil {
+		return err
+	}
+
+	h.bindSessionFromReplyAnchor(msg)
+	if handled, err := h.tryResolvePendingApproval(ctx, msg); handled || err != nil {
+		return err
+	}
+	input := h.buildUserTurnInput(ctx, msg.Text, msg.Attachments)
+	if msg.ReplyTo != nil {
+		input = h.withReplyAnchorContext(input, msg)
+	}
+
+	// Regular text in private chats → forward to Agent
+	if msg.Chat.Type == gateway.ChatPrivate {
+		return h.dispatchChatAsync(ctx, msg, input)
+	}
+
+	// Group chats: only respond if mentioned or replied to (already filtered by adapter)
+	return h.dispatchChatAsync(ctx, msg, input)
+}
+
+func (h *Handler) tryResolvePendingApproval(ctx context.Context, msg *gateway.Message) (bool, error) {
+	if h == nil || msg == nil || strings.TrimSpace(msg.Text) == "" || len(msg.Attachments) > 0 {
+		return false, nil
+	}
+	resolver, ok := h.chatService().(interface {
+		ResolvePendingText(sessionID, text string) (tool.PendingApproval, bool, error)
+	})
+	if !ok || resolver == nil {
+		return false, nil
+	}
+	sessionID := h.getSessionID(msg.Chat.ID)
+	resolved, handled, err := resolver.ResolvePendingText(sessionID, msg.Text)
+	if !handled {
+		return false, nil
+	}
+	if err != nil {
+		return true, h.sendLuckyNotice(ctx, msg, "没能处理这次确认："+err.Error())
+	}
+	return true, h.sendLuckyNotice(ctx, msg, "已收到："+resolved.Summary)
+}
+
+func (h *Handler) bindSessionFromReplyAnchor(msg *gateway.Message) bool {
+	if h == nil || msg == nil || msg.ReplyTo == nil {
+		return false
+	}
+	resolver := h.replyAnchorResolver()
+	if resolver == nil {
+		return false
+	}
+	sessionID, ok := resolver.ResolveExternalReplyAnchor("telegram", msg.Chat.ID, msg.ReplyTo.ID)
+	if !ok {
+		return false
+	}
+	if sessions := h.sessionManager(); sessions != nil {
+		if _, exists := sessions.Get(sessionID); !exists {
+			return false
+		}
+	}
+	h.bindSessionID(telegramConversationScope(msg), sessionID)
+	return true
+}
+
+func (h *Handler) buildUserTurnInput(ctx context.Context, baseText string, attachments []gateway.Attachment) agent.UserTurnInput {
+	baseText = strings.TrimSpace(baseText)
+	if len(attachments) == 0 {
+		return agent.TextUserTurnInput(baseText)
+	}
+
+	return agent.MultimodalUserTurnInput(baseText, attachments)
+}
+
+func (h *Handler) inputWithMessageScope(input agent.UserTurnInput, msg *gateway.Message) agent.UserTurnInput {
+	if msg == nil {
+		return input
+	}
+	scope := agent.TurnScope{
+		Platform:    "telegram",
+		ChatID:      msg.Chat.ID,
+		ChatType:    msg.Chat.Type.String(),
+		SenderID:    msg.Sender.ID,
+		SenderName:  msg.Sender.Username,
+		DisplayName: msg.Sender.DisplayName(),
+	}
+	return input.WithScope(scope)
+}
+
+func (h *Handler) withReplyAnchorContext(input agent.UserTurnInput, msg *gateway.Message) agent.UserTurnInput {
+	if msg == nil || msg.ReplyTo == nil {
+		return input
+	}
+	repliedText := strings.TrimSpace(msg.ReplyTo.Text)
+	if repliedText == "" {
+		repliedText = telegramAttachmentSummary(msg.ReplyTo.Attachments)
+	}
+	if repliedText == "" {
+		return input
+	}
+
+	input = input.Normalize()
+	userRequest := strings.TrimSpace(input.RoutingText)
+	if userRequest == "" {
+		userRequest = "(no additional text)"
+	}
+
+	replyAwareText := fmt.Sprintf(`You are answering a Telegram reply to a previous LuckyAgent or cron message.
+
+[Replied Telegram message]
+%s
+
+[User request]
+%s
+
+Use the replied message as the primary context for this turn. If the user asks "看看", "看一眼摘要", "摘要", "总结", or "summary", summarize the replied message directly. Do not consult unrelated runtime, cron, or session state unless the user explicitly asks for a fresh status check.`, repliedText, userRequest)
+
+	return input.WithRoutingText(replyAwareText)
+}
+
+func telegramTurnAttachments(msg *gateway.Message) []gateway.Attachment {
+	if msg == nil {
+		return nil
+	}
+	out := append([]gateway.Attachment(nil), msg.Attachments...)
+	if msg.ReplyTo == nil || len(msg.ReplyTo.Attachments) == 0 {
+		return out
+	}
+	seen := make(map[string]bool, len(out)+len(msg.ReplyTo.Attachments))
+	for _, att := range out {
+		if key := telegramAttachmentKey(att); key != "" {
+			seen[key] = true
+		}
+	}
+	for _, att := range msg.ReplyTo.Attachments {
+		key := telegramAttachmentKey(att)
+		if key != "" && seen[key] {
+			continue
+		}
+		if key != "" {
+			seen[key] = true
+		}
+		out = append(out, att)
+	}
+	return out
+}
+
+func telegramAttachmentKey(att gateway.Attachment) string {
+	parts := []string{
+		string(att.Type),
+		strings.TrimSpace(att.FileID),
+		strings.TrimSpace(att.FilePath),
+		strings.TrimSpace(att.FileURL),
+		strings.TrimSpace(att.FileName),
+		fmt.Sprintf("%d", att.FileSize),
+	}
+	return strings.Join(parts, "|")
+}
+
+func telegramAttachmentSummary(attachments []gateway.Attachment) string {
+	if len(attachments) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(attachments))
+	for _, att := range attachments {
+		name := strings.TrimSpace(att.FileName)
+		switch att.Type {
+		case gateway.AttachmentImage:
+			if name == "" {
+				name = "image"
+			}
+			parts = append(parts, "image: "+name)
+		case gateway.AttachmentAudio:
+			if name == "" {
+				name = "audio"
+			}
+			parts = append(parts, "audio: "+name)
+		case gateway.AttachmentVideo:
+			if name == "" {
+				name = "video"
+			}
+			parts = append(parts, "video: "+name)
+		case gateway.AttachmentDocument:
+			if name == "" {
+				name = "document"
+			}
+			parts = append(parts, "document: "+name)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "[Replied Telegram attachments]\n" + strings.Join(parts, "\n")
+}
+
+// handleCommand dispatches bot commands.
+func (h *Handler) handleCommand(ctx context.Context, msg *gateway.Message) error {
+	command := normalizeTelegramCommandName(msg.Command)
+	if handler, ok := h.commands[command]; ok {
+		msg.Command = command
+		return handler(ctx, msg)
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("Unknown command: /%s\nType /help for available commands.", msg.Command))
+}
+
+func normalizeTelegramCommandName(command string) string {
+	command = strings.TrimSpace(command)
+	command = strings.TrimPrefix(command, "/")
+	command = strings.ToLower(command)
+	switch command {
+	case "msg-gateway":
+		return "msg_gateway"
+	case "remember-long":
+		return "remember_long"
+	default:
+		return command
+	}
+}
+
+func (h *Handler) handleLucky(ctx context.Context, msg *gateway.Message) error {
+	action := luckycollector.ParseLuckyAction(msg.Args)
+	collector := h.luckyCollector()
+	key := luckycollector.KeyForMessage("telegram", msg)
+
+	switch action {
+	case luckycollector.LuckyActionOn:
+		h.bindSessionFromReplyAnchor(msg)
+		status, err := collector.Start(key)
+		if errors.Is(err, luckycollector.ErrAlreadyActive) {
+			return h.sendLuckyNotice(ctx, msg, fmt.Sprintf("Lucky 已经在收集中：当前 %d 段，附件 %d 个。发送 /lucky off 提交，/lucky cancel 放弃。", status.SegmentCount, status.AttachmentCount))
+		}
+		if err != nil {
+			return h.sendLuckyNotice(ctx, msg, fmt.Sprintf("Lucky 开启失败：%s", err.Error()))
+		}
+		return h.sendLuckyNotice(ctx, msg, "Lucky 已开启。接下来发送的多段消息会先被收集；发送 /lucky off 后再统一交给 agent。")
+
+	case luckycollector.LuckyActionOff:
+		batch, err := collector.Finish(key)
+		if errors.Is(err, luckycollector.ErrInactive) {
+			return h.sendLuckyNotice(ctx, msg, "当前没有正在进行的 Lucky 收集。发送 /lucky on 开始。")
+		}
+		if errors.Is(err, luckycollector.ErrEmptyBatch) {
+			return h.sendLuckyNotice(ctx, msg, "没有收集到消息，已退出 Lucky 收集模式。")
+		}
+		if err != nil {
+			return h.sendLuckyNotice(ctx, msg, fmt.Sprintf("Lucky 提交失败：%s", err.Error()))
+		}
+		input := agent.UserTurnInputFromTurn(batch.UserTurnInput())
+		finalMsg := *msg
+		finalMsg.IsCommand = false
+		finalMsg.Command = ""
+		finalMsg.Args = ""
+		finalMsg.Text = input.RoutingText
+		finalMsg.Attachments = batch.Attachments()
+		finalMsg.IsGroupTrigger = false
+		return h.dispatchChatAsync(ctx, &finalMsg, input)
+
+	case luckycollector.LuckyActionStatus:
+		status := collector.Status(key)
+		if !status.Active {
+			return h.sendLuckyNotice(ctx, msg, "Lucky 未开启。发送 /lucky on 开始收集多段消息。")
+		}
+		return h.sendLuckyNotice(ctx, msg, fmt.Sprintf("Lucky 正在收集：%d 段，附件 %d 个。发送 /lucky off 提交，/lucky cancel 放弃。", status.SegmentCount, status.AttachmentCount))
+
+	case luckycollector.LuckyActionCancel:
+		status, ok := collector.Cancel(key)
+		if !ok {
+			return h.sendLuckyNotice(ctx, msg, "当前没有正在进行的 Lucky 收集。")
+		}
+		return h.sendLuckyNotice(ctx, msg, fmt.Sprintf("已取消 Lucky 收集，丢弃 %d 段消息和 %d 个附件。", status.SegmentCount, status.AttachmentCount))
+
+	default:
+		return h.sendLuckyNotice(ctx, msg, "用法：/lucky on | /lucky off | /lucky status | /lucky cancel")
+	}
+}
+
+// handleStart sends a welcome message.
+func (h *Handler) handleStart(ctx context.Context, msg *gateway.Message) error {
+	return h.adapter.Send(ctx, msg.Chat.ID, telegramWelcomeMessage())
+}
+
+// handleHelp lists available commands.
+func (h *Handler) handleHelp(ctx context.Context, msg *gateway.Message) error {
+	return h.adapter.Send(ctx, msg.Chat.ID, telegramHelpMessage())
+}
+
+// handleChat sends a message to the agent and returns the response.
+// Uses streaming output with thinking/tool-call visualization when available.
+func (h *Handler) handleChat(ctx context.Context, msg *gateway.Message, input agent.UserTurnInput) error {
+	input = input.Normalize()
+	if recorder := h.routeRecorder(); recorder != nil {
+		recorder.RecordRecentChatTarget("telegram", msg.Chat.ID, msg.ID)
+	}
+	if strings.TrimSpace(input.RoutingText) == "" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Please provide a message. Usage: /chat <message>")
+	}
+
+	scope := telegramConversationScope(msg)
+	taskCtx, task := h.beginChatTask(scope, ctx)
+	defer h.finishChatTask(scope, task)
+
+	h.reactToIncomingMessage(msg)
+
+	sessionID := h.getSessionID(scope)
+
+	// 群聊中在输入文本前加上发送者名字，让 agent 知道是谁在说话
+	if msg.IsGroupTrigger && msg.Sender.DisplayName() != "" {
+		input = input.WithRoutingText(fmt.Sprintf("[%s]: %s", msg.Sender.DisplayName(), input.RoutingText))
+	}
+	input = input.WithRoutingText(telegramMediaDeliveryGuidance(input.RoutingText))
+	routingText := input.RoutingText
+
+	if agent.IsSimpleLocalInspectionTask(routingText) {
+		return h.handleChatSync(taskCtx, msg, input, sessionID)
+	}
+
+	// 自然语言进度模式：直接按步骤发独立消息，最终结论也作为“最后一条新消息”发送。
+	// 这样可以避免结论写回到最早的占位流消息，导致视觉上跑到最上面。
+	if h.effectiveProgressAsMessages() && h.effectiveProgressAsNaturalLanguage() {
+		return h.handleChatNarrativeStream(taskCtx, msg, input, sessionID)
+	}
+
+	// 尝试流式输出（Adapter 已实现 StreamGateway）
+	sender, err := h.adapter.SendStream(taskCtx, msg.Chat.ID, msg.ID)
+	if err == nil {
+		return h.handleChatStream(taskCtx, sender, msg, input, sessionID)
+	}
+	// SendStream 失败，回退到非流式
+
+	// 回退到非流式
+	return h.handleChatSync(taskCtx, msg, input, sessionID)
+}
+
+func (h *Handler) reactToIncomingMessage(msg *gateway.Message) {
+	emoji, ok := telegramAutoReaction(msg, h != nil && h.disableAutoReaction)
+	if !ok || h == nil || h.adapter == nil {
+		return
+	}
+	go h.adapter.ReactToMessage(msg.Chat.ID, msg.ID, emoji)
+}
+
+func telegramAutoReaction(msg *gateway.Message, disabled bool) (string, bool) {
+	if disabled || msg == nil || strings.TrimSpace(msg.ID) == "" {
+		return "", false
+	}
+	switch msg.Chat.Type {
+	case gateway.ChatPrivate:
+		// Private chats use a consistent acknowledgement, including replies to
+		// earlier bot messages.
+		return "👍", true
+	case gateway.ChatGroup, gateway.ChatSuperGroup, gateway.ChatChannel:
+	default:
+		return "", false
+	}
+	if msg.ReplyTo != nil {
+		return "👀", true
+	}
+	return "👍", true
+}
+
+func (h *Handler) sendProgressMessage(msg *gateway.Message, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" || h.adapter == nil || msg == nil {
+		return
+	}
+
+	sendCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	// 群聊里用 reply 方式，让中间步骤挂在原消息下，阅读更清晰。
+	if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+		_ = h.adapter.SendWithReply(sendCtx, msg.Chat.ID, msg.ID, text)
+		return
+	}
+	_ = h.adapter.Send(sendCtx, msg.Chat.ID, text)
+}
+
+// sendComputerObservation forwards a freshly captured desktop frame to the
+// Telegram chat. Computer observations are internal file-backed events for
+// the model; without this explicit bridge Telegram users only receive the
+// textual tool result and never see the screenshot.
+func (h *Handler) sendComputerObservation(ctx context.Context, msg *gateway.Message, obs *agent.ObservationEvent) {
+	if h == nil || h.adapter == nil || msg == nil || obs == nil {
+		return
+	}
+	path := strings.TrimSpace(obs.FilePath)
+	if path == "" {
+		return
+	}
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		h.sendProgressMessage(msg, "⚠️ 截图文件不存在或已过期，无法发送")
+		return
+	}
+	replyTo := ""
+	if msg.Chat.Type != gateway.ChatPrivate {
+		replyTo = strings.TrimSpace(msg.ID)
+	}
+	caption := "🖥️ Computer observation"
+	if frame := strings.TrimSpace(obs.FrameID); frame != "" {
+		caption += " · " + frame
+	}
+	if err := h.adapter.SendPhoto(ctx, msg.Chat.ID, replyTo, path, caption); err != nil {
+		h.sendProgressMessage(msg, "⚠️ 截图发送失败："+utils.TruncateKeepLength(err.Error(), 160))
+	}
+}
+
+func (h *Handler) sendTurnComputerObservation(ctx context.Context, msg *gateway.Message, obs *turn.ObservationEvent) {
+	if obs == nil {
+		return
+	}
+	h.sendComputerObservation(ctx, msg, agent.FromTurnChatEvent(turn.ChatEvent{Observation: obs}).Observation)
+}
+
+func (h *Handler) sendProgressMessageHTML(msg *gateway.Message, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" || h.adapter == nil || msg == nil {
+		return
+	}
+
+	sendCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+		_ = h.adapter.SendWithReplyHTML(sendCtx, msg.Chat.ID, msg.ID, text)
+		return
+	}
+	_ = h.adapter.SendHTML(sendCtx, msg.Chat.ID, text)
+}
+
+func (h *Handler) sendCommandHTML(ctx context.Context, msg *gateway.Message, text string) error {
+	if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+		return h.adapter.SendWithReplyHTML(ctx, msg.Chat.ID, msg.ID, text)
+	}
+	return h.adapter.SendHTML(ctx, msg.Chat.ID, text)
+}
+
+func (h *Handler) newProgressCardUpdater(msg *gateway.Message) func(string) {
+	if h == nil || h.adapter == nil || msg == nil {
+		return func(text string) {
+			h.sendProgressMessage(msg, text)
+		}
+	}
+
+	var sender gateway.StreamSender
+	var stream htmlCardStreamSender
+	var parts []string
+	fallbackSent := false
+
+	return func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		section := normalizeTelegramProgressSection(text)
+		if section == "" {
+			return
+		}
+		parts = appendTelegramProgressSection(parts, section)
+		combined := presentation.RenderTelegramProgressHistoryCard(parts)
+		if strings.TrimSpace(combined) == "" {
+			return
+		}
+		if stream == nil && sender == nil && !fallbackSent {
+			sendCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+
+			s, err := h.adapter.SendStream(sendCtx, msg.Chat.ID, msg.ID)
+			if err == nil {
+				sender = s
+				if ts, ok := s.(htmlCardStreamSender); ok {
+					stream = ts
+				}
+			}
+		}
+		if stream != nil {
+			_ = stream.SetHTMLCard(combined)
+			return
+		}
+		if sender != nil {
+			_ = sender.SetResult(combined)
+			_ = sender.Finish()
+			return
+		}
+		if !fallbackSent {
+			h.sendProgressMessage(msg, combined)
+			fallbackSent = true
+		}
+	}
+}
+
+func appendTelegramProgressSection(parts []string, text string) []string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return parts
+	}
+	if len(parts) > 0 && strings.TrimSpace(parts[len(parts)-1]) == text {
+		return parts
+	}
+	for _, part := range parts {
+		if strings.TrimSpace(part) == text {
+			return parts
+		}
+	}
+	return append(parts, text)
+}
+
+func normalizeTelegramProgressSection(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+
+	const openTag = "<blockquote expandable>"
+	const closeTag = "</blockquote>"
+	if start := strings.Index(text, openTag); start >= 0 {
+		start += len(openTag)
+		if end := strings.LastIndex(text, closeTag); end > start {
+			text = text[start:end]
+		}
+	}
+	text = strings.ReplaceAll(text, "<br>", "\n")
+	text = strings.ReplaceAll(text, "<br/>", "\n")
+	text = strings.ReplaceAll(text, "<br />", "\n")
+	text = strings.TrimSpace(text)
+	return strings.TrimSpace(html.UnescapeString(text))
+}
+
+func (h *Handler) generateRoundProgressFeedback(ctx context.Context, msg *gateway.Message, userInput string, round int, observations []string, progressHistory []string, lastProgress string) string {
+	chat := h.chatService()
+	if len(observations) == 0 || chat == nil {
+		return ""
+	}
+	summaryCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+
+	progressObservations := append([]string(nil), observations...)
+	for _, prev := range progressHistory {
+		prev = strings.TrimSpace(prev)
+		if prev == "" {
+			continue
+		}
+		progressObservations = append([]string{"Previous user-facing update: " + prev}, progressObservations...)
+	}
+
+	summary, err := chat.ProgressFeedbackWithPrompt(summaryCtx, userInput, round, progressObservations, h.effectiveProgressSummaryPrompt())
+	if err != nil {
+		return ""
+	}
+	summary = strings.TrimSpace(summary)
+	if summary == "" || summary == lastProgress {
+		return ""
+	}
+	return smoothProgressSummary(summary, round, progressHistory)
+}
+
+func (h *Handler) flushRoundProgress(ctx context.Context, msg *gateway.Message, userInput string, round int, observations []string, progressHistory *[]string, lastProgress *string) {
+	h.flushRoundProgressWithEmitter(ctx, msg, userInput, round, observations, progressHistory, lastProgress, h.sendProgressMessage)
+}
+
+func (h *Handler) flushRoundProgressWithEmitter(ctx context.Context, msg *gateway.Message, userInput string, round int, observations []string, progressHistory *[]string, lastProgress *string, emit func(*gateway.Message, string)) {
+	if !h.effectiveProgressSummaryWithLLM() {
+		return
+	}
+	var history []string
+	if progressHistory != nil {
+		history = append(history, (*progressHistory)...)
+	}
+	progress := h.generateRoundProgressFeedback(ctx, msg, userInput, round, observations, history, strings.TrimSpace(*lastProgress))
+	if progress == "" {
+		return
+	}
+	if emit == nil {
+		emit = h.sendProgressMessage
+	}
+	emit(msg, formatTelegramProgressSummary(progress))
+	*lastProgress = progress
+	appendProgressHistory(progressHistory, progress)
+}
+
+func formatGatewayApprovalPrompt(evt turn.ChatEvent) string {
+	kind := "approval"
+	requestID := ""
+	prompt := strings.TrimSpace(evt.Content)
+	toolName := strings.TrimSpace(evt.Name)
+	if evt.Approval != nil {
+		if evt.Approval.Kind != "" {
+			kind = evt.Approval.Kind
+		}
+		requestID = strings.TrimSpace(evt.Approval.RequestID)
+		if text := strings.TrimSpace(evt.Approval.Prompt); text != "" {
+			prompt = text
+		} else if text := strings.TrimSpace(evt.Approval.Reason); text != "" {
+			prompt = text
+		}
+		if toolName == "" {
+			toolName = strings.TrimSpace(evt.Approval.Tool)
+		}
+	}
+	if prompt == "" {
+		prompt = "需要你确认后才能继续"
+	}
+	var b strings.Builder
+	if kind == "credential" {
+		b.WriteString("🔒 需要填写凭据，但这个聊天通道不能安全接收密钥。\n")
+		b.WriteString("请在本机 CLI、GUI 或安卓客户端的掩码表单里填写。不要把密钥回复到聊天里。")
+		if requestID != "" {
+			b.WriteString("\n编号: ")
+			b.WriteString(requestID)
+		}
+		return b.String()
+	}
+	if kind == "input" {
+		b.WriteString("📝 需要你补充信息\n")
+		b.WriteString(prompt)
+		b.WriteString("\n\n直接回复内容即可。")
+	} else {
+		b.WriteString("🔐 需要你确认后才能继续\n")
+		if toolName != "" {
+			b.WriteString("工具: ")
+			b.WriteString(toolName)
+			b.WriteString("\n")
+		}
+		b.WriteString(prompt)
+		b.WriteString("\n\n回复「允许」或「拒绝」。")
+	}
+	if requestID != "" {
+		b.WriteString("\n编号: ")
+		b.WriteString(requestID)
+	}
+	return b.String()
+}
+
+func formatTelegramProgressSummary(progress string) string {
+	card := presentation.RenderTelegramSummaryCard(progress)
+	if strings.TrimSpace(card) == "" {
+		return progress
+	}
+	return card
+}
+
+func appendProgressHistory(history *[]string, progress string) {
+	if history == nil {
+		return
+	}
+	progress = strings.TrimSpace(progress)
+	if progress == "" {
+		return
+	}
+	entries := append([]string(nil), (*history)...)
+	if len(entries) > 0 && strings.TrimSpace(entries[len(entries)-1]) == progress {
+		*history = entries
+		return
+	}
+	entries = append(entries, progress)
+	if len(entries) > 3 {
+		entries = entries[len(entries)-3:]
+	}
+	*history = entries
+}
+
+func smoothProgressSummary(summary string, round int, history []string) string {
+	summary = strings.TrimSpace(summary)
+	if summary == "" || len(history) == 0 {
+		return summary
+	}
+	lower := strings.ToLower(summary)
+	switch {
+	case strings.HasPrefix(lower, "i've "),
+		strings.HasPrefix(lower, "i’m "),
+		strings.HasPrefix(lower, "i'm "),
+		strings.HasPrefix(lower, "i have "):
+		return continuityCue(round) + summary
+	case strings.HasPrefix(lower, "i've started"),
+		strings.HasPrefix(lower, "i started"),
+		strings.HasPrefix(lower, "i’m still"),
+		strings.HasPrefix(lower, "i'm still"):
+		return continuityCue(round) + summary
+	default:
+		return summary
+	}
+}
+
+func continuityCue(round int) string {
+	switch round % 4 {
+	case 0:
+		return "That suggests "
+	case 1:
+		return "So far, "
+	case 2:
+		return "At this point, "
+	default:
+		return "The latest result shows "
+	}
+}
+
+func (h *Handler) sendAssistantResponse(ctx context.Context, msg *gateway.Message, response string) error {
+	if h.adapter == nil || msg == nil {
+		return fmt.Errorf("telegram: adapter or message is nil")
+	}
+
+	text, media, err := resolveOutboundMediaResponse(response)
+	if err != nil {
+		return err
+	}
+	text, media = prepareOutboundMediaResponse(text, media)
+	if len(media) == 0 {
+		if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+			if err := h.adapter.SendWithReply(ctx, msg.Chat.ID, msg.ID, text); err != nil {
+				return err
+			}
+		} else if err := h.adapter.Send(ctx, msg.Chat.ID, text); err != nil {
+			return err
+		}
+		return h.sendRandomMemeIfNeeded(ctx, msg, text)
+	}
+
+	replyToMsgID := ""
+	if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+		replyToMsgID = msg.ID
+	}
+
+	if strings.TrimSpace(text) != "" {
+		if replyToMsgID != "" {
+			if err := h.adapter.SendWithReply(ctx, msg.Chat.ID, replyToMsgID, text); err != nil {
+				return err
+			}
+		} else if err := h.adapter.Send(ctx, msg.Chat.ID, text); err != nil {
+			return err
+		}
+	}
+
+	if err := h.sendAssistantMedia(ctx, msg, media); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *Handler) sendAssistantMedia(ctx context.Context, msg *gateway.Message, media []outboundMedia) error {
+	if h.adapter == nil || msg == nil || len(media) == 0 {
+		return nil
+	}
+
+	replyToMsgID := ""
+	if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+		replyToMsgID = msg.ID
+	}
+
+	reportProgress := shouldReportMediaDelivery(media)
+	for index, item := range media {
+		if reportProgress {
+			h.sendProgressMessage(msg, fmt.Sprintf("📤 正在发送附件 %d/%d", index+1, len(media)))
+		}
+		switch item.Kind {
+		case outboundMediaPhoto:
+			if err := h.adapter.SendPhoto(ctx, msg.Chat.ID, replyToMsgID, item.Source, item.Caption); err != nil {
+				return err
+			}
+		case outboundMediaDocument:
+			if err := h.adapter.SendDocument(ctx, msg.Chat.ID, replyToMsgID, item.Source, item.Caption); err != nil {
+				return err
+			}
+		}
+	}
+	if reportProgress {
+		h.sendProgressMessage(msg, "✅ 附件发送完成")
+	}
+
+	return nil
+}
+
+func shouldReportMediaDelivery(media []outboundMedia) bool {
+	if len(media) > 1 {
+		return true
+	}
+	if len(media) != 1 || media[0].Kind != outboundMediaDocument {
+		return false
+	}
+	path := normalizeLocalMediaPath(media[0].Source)
+	info, err := os.Stat(path)
+	return err == nil && info.Size() >= 5*1024*1024
+}
+
+func (h *Handler) sendRandomMemeIfNeeded(ctx context.Context, msg *gateway.Message, text string) error {
+	if !h.shouldSendRandomMeme(msg, text) {
+		return nil
+	}
+	memePath, ok := h.pickRandomMemePath()
+	if !ok {
+		return nil
+	}
+	if err := h.adapter.SendPhoto(ctx, msg.Chat.ID, "", memePath, ""); err != nil {
+		return err
+	}
+	h.recordMemeSent(msg.Chat.ID)
+	return nil
+}
+
+func (h *Handler) shouldSendRandomMeme(msg *gateway.Message, text string) bool {
+	if h == nil || h.adapter == nil || msg == nil {
+		return false
+	}
+	if strings.TrimSpace(h.memeDir) == "" || h.memeProbability <= 0 || h.memeRand == nil || h.memeNow == nil {
+		return false
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || len(text) > 400 || strings.Contains(text, "```") {
+		return false
+	}
+
+	lower := strings.ToLower(text)
+	for _, blocked := range []string{"❌", "error:", "请求超时", "failed", "traceback", "panic:"} {
+		if strings.Contains(lower, strings.ToLower(blocked)) {
+			return false
+		}
+	}
+
+	for _, blocked := range []string{"```", "panic:", "traceback", "stack trace", "unexpected status code"} {
+		if strings.Contains(lower, blocked) {
+			return false
+		}
+	}
+
+	// Long, dense technical replies are usually a bad place to inject a meme.
+	if strings.Count(text, "\n") > 12 {
+		return false
+	}
+
+	now := h.memeNow()
+	h.mu.RLock()
+	lastSent := h.memeLastSent[msg.Chat.ID]
+	h.mu.RUnlock()
+	if !lastSent.IsZero() && now.Sub(lastSent) < h.memeCooldown {
+		return false
+	}
+
+	probability := h.memeProbability
+	for _, signal := range []string{"搞定", "完成", "哈哈", "好耶", "ok", "nice", "done", "已处理", "已完成", "可以", "当然", "没问题", "行", "收到"} {
+		if strings.Contains(lower, strings.ToLower(signal)) {
+			probability += 0.20
+			break
+		}
+	}
+	if probability > 0.90 {
+		probability = 0.90
+	}
+	return h.memeRand.Float64() < probability
+}
+
+func (h *Handler) pickRandomMemePath() (string, bool) {
+	entries, err := os.ReadDir(h.memeDir)
+	if err != nil {
+		return "", false
+	}
+	candidates := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if !slices.Contains([]string{".png", ".jpg", ".jpeg", ".webp", ".gif"}, ext) {
+			continue
+		}
+		candidates = append(candidates, filepath.Join(h.memeDir, entry.Name()))
+	}
+	if len(candidates) == 0 {
+		return "", false
+	}
+	return candidates[h.memeRand.Intn(len(candidates))], true
+}
+
+func (h *Handler) recordMemeSent(chatID string) {
+	if h == nil || h.memeNow == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.memeLastSent[chatID] = h.memeNow()
+}
+
+func (h *Handler) sendFinalAssistantResponse(msg *gateway.Message, response string) {
+	if msg == nil || h.adapter == nil {
+		return
+	}
+
+	sendCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := h.sendAssistantResponse(sendCtx, msg, response); err != nil {
+		fallback := fmt.Sprintf("❌ Failed to send media response: %s", utils.TruncateKeepLength(err.Error(), 200))
+		if msg.Chat.Type != gateway.ChatPrivate && strings.TrimSpace(msg.ID) != "" {
+			if fallbackErr := h.adapter.SendWithReply(sendCtx, msg.Chat.ID, msg.ID, fallback); fallbackErr != nil {
+				fmt.Printf("[telegram] final response fallback delivery failed: %v (original: %v)\n", fallbackErr, err)
+			}
+			return
+		}
+		if fallbackErr := h.adapter.Send(sendCtx, msg.Chat.ID, fallback); fallbackErr != nil {
+			fmt.Printf("[telegram] final response fallback delivery failed: %v (original: %v)\n", fallbackErr, err)
+		}
+	}
+}
+
+func (h *Handler) openTurnChatEventStream(ctx context.Context, chatID string, input agent.UserTurnInput, sessionID string) (<-chan turn.ChatEvent, error) {
+	chat := h.chatService()
+	if chat == nil {
+		return nil, fmt.Errorf("chat runtime not available")
+	}
+	var events <-chan turn.ChatEvent
+	var err error
+	if neutral, ok := chat.(turnEventChatRuntime); ok {
+		events, err = neutral.ChatWithSessionStreamTurnEvents(ctx, sessionID, agent.TurnInput(input))
+	} else {
+		legacyEvents, legacyErr := chatWithSessionStreamTurn(ctx, chat, sessionID, input)
+		err = legacyErr
+		if legacyErr == nil {
+			events = agent.ToTurnChatEventStream(ctx, legacyEvents)
+		}
+	}
+	if err == nil {
+		return events, nil
+	}
+	if !strings.Contains(err.Error(), "session not found") {
+		return nil, err
+	}
+
+	h.resetSession(chatID)
+	retrySessionID := h.getSessionID(chatID)
+	if neutral, ok := chat.(turnEventChatRuntime); ok {
+		return neutral.ChatWithSessionStreamTurnEvents(ctx, retrySessionID, agent.TurnInput(input))
+	}
+	legacyEvents, retryErr := chatWithSessionStreamTurn(ctx, chat, retrySessionID, input)
+	if retryErr != nil {
+		return nil, retryErr
+	}
+	return agent.ToTurnChatEventStream(ctx, legacyEvents), nil
+}
+
+func runTurnChatEventLoop(
+	chatCtx context.Context,
+	events <-chan turn.ChatEvent,
+	onTimeout func(err error) (sentResult bool),
+	onEvent func(evt turn.ChatEvent) (stop bool, sentResult bool),
+) (sentResult bool) {
+	for {
+		select {
+		case <-chatCtx.Done():
+			if onTimeout == nil {
+				return false
+			}
+			return onTimeout(chatCtx.Err())
+
+		case evt, ok := <-events:
+			if !ok {
+				return sentResult
+			}
+			stop, marked := onEvent(evt)
+			if marked {
+				sentResult = true
+			}
+			if stop {
+				return sentResult
+			}
+		}
+	}
+}
+
+// handleChatNarrativeStream 自然语言进度模式（不使用流式占位消息）。
+// 中间步骤和最终结论都作为独立消息发送，保证“结论在最后”。
+func (h *Handler) handleChatNarrativeStream(ctx context.Context, msg *gateway.Message, input agent.UserTurnInput, sessionID string) error {
+	routingText := input.RoutingText
+	emitProgress := h.newProgressCardUpdater(msg)
+	emitProgressForMsg := func(_ *gateway.Message, text string) {
+		emitProgress(text)
+	}
+	// 启动 typing indicator（每 5 秒刷新一次，直到完成）
+	typingCtx, typingCancel := context.WithCancel(context.Background())
+	defer typingCancel()
+	go h.adapter.SendTypingLoop(typingCtx, msg.Chat.ID)
+
+	chatCtx, chatCancel := context.WithTimeout(ctx, h.effectiveChatStreamTimeout())
+	defer chatCancel()
+
+	events, err := h.openTurnChatEventStream(chatCtx, telegramConversationScope(msg), input, sessionID)
+	if err != nil {
+		switch {
+		case isTaskTimeoutError(err):
+			emitProgress(h.telegramTimeoutFeedback(err))
+		case isTaskCanceledError(err):
+			emitProgress("🛑 当前任务已停止")
+		default:
+			emitProgress(telegramChatErrorFeedback(err))
+		}
+		return nil
+	}
+
+	var finalContent strings.Builder
+	toolCallCount := 0
+	lastProgress := ""
+	var toolNarratives []string
+	var toolTraceSteps []presentation.TelegramToolTraceStep
+	toolTraceSent := false
+	agentTraceSent := false
+	var memoryTraceCards []memory.SearchTrace
+	memoryTraceSent := false
+	currentRound := 1
+	var roundObservations []string
+	var progressHistory []string
+	summaryMode := h.effectiveProgressSummaryWithLLM()
+
+	sentResult := runTurnChatEventLoop(
+		chatCtx,
+		events,
+		func(err error) bool {
+			if errors.Is(err, context.DeadlineExceeded) {
+				emitProgress(h.telegramTimeoutFeedback(context.DeadlineExceeded))
+			} else {
+				emitProgress("🛑 当前任务已停止")
+			}
+			return true
+		},
+		func(evt turn.ChatEvent) (bool, bool) {
+			switch evt.Type {
+			case turn.ChatEventObservation:
+				h.sendTurnComputerObservation(chatCtx, msg, evt.Observation)
+
+			case turn.ChatEventThinking:
+				if summaryMode {
+					if nextRound := presentation.ExtractRoundNumber(evt.Content); nextRound > currentRound {
+						if progress := h.generateRoundProgressFeedback(chatCtx, msg, routingText, currentRound, roundObservations, progressHistory, lastProgress); progress != "" {
+							emitProgress(formatTelegramProgressSummary(progress))
+							lastProgress = progress
+							appendProgressHistory(&progressHistory, progress)
+						}
+						roundObservations = nil
+						currentRound = nextRound
+					}
+				} else {
+					progress := presentation.RenderTelegramThinkingCard(evt.Content)
+					if strings.TrimSpace(progress) == "" {
+						progress = presentation.HumanizeThinkingProgress(evt.Content)
+					}
+					if strings.TrimSpace(progress) != "" && progress != lastProgress {
+						emitProgress(progress)
+						lastProgress = progress
+					}
+				}
+
+			case turn.ChatEventApprovalRequired:
+				emitProgress(formatGatewayApprovalPrompt(evt))
+
+			case turn.ChatEventToolCall:
+				toolCallCount++
+				toolTraceSteps = append(toolTraceSteps, presentation.TelegramToolTraceStep{
+					Name: evt.Name,
+					Args: evt.Args,
+				})
+				if summaryMode {
+					if line := presentation.HumanizeToolCall(evt.Name, evt.Args); line != "" {
+						roundObservations = append(roundObservations, "Tool call: "+line)
+					}
+				}
+
+			case turn.ChatEventToolResult:
+				if evt.Name == telegramMemoryTraceEventName {
+					if h.effectiveMemoryTrace() {
+						if trace, ok := presentation.ParseTelegramMemoryTracePayload(evt.Result); ok {
+							memoryTraceCards = append(memoryTraceCards, trace)
+						}
+					}
+					break
+				}
+				if evt.Name == "delegate_task" {
+					h.observeDelegateToolResult(msg, evt.Result)
+				}
+				if len(toolTraceSteps) > 0 {
+					for i := len(toolTraceSteps) - 1; i >= 0; i-- {
+						if toolTraceSteps[i].Name == evt.Name && toolTraceSteps[i].Result == "" {
+							toolTraceSteps[i].Result = evt.Result
+							toolTraceSteps[i].Success = !strings.HasPrefix(strings.ToLower(strings.TrimSpace(evt.Result)), "error:")
+							break
+						}
+					}
+				}
+				if shouldPrependToolNarratives(h.effectiveShowToolDetailsInResult(), true) {
+					if line := presentation.HumanizeToolResult(evt.Name, evt.Result); line != "" {
+						toolNarratives = append(toolNarratives, line)
+					}
+				}
+
+			case turn.ChatEventContent:
+				finalContent.WriteString(evt.Content)
+
+			case turn.ChatEventDone:
+				if summaryMode {
+					h.flushRoundProgressWithEmitter(chatCtx, msg, routingText, currentRound, roundObservations, &progressHistory, &lastProgress, emitProgressForMsg)
+					roundObservations = nil
+				}
+				if !memoryTraceSent {
+					h.sendMemoryTraceCards(msg, memoryTraceCards)
+					memoryTraceSent = true
+				}
+				if !toolTraceSent {
+					if card := presentation.RenderTelegramToolTraceCardWithTemplateDetails(toolTraceSteps, h.effectiveShowToolDetailsInResult(), h.toolTraceTemplates); strings.TrimSpace(card) != "" {
+						h.sendProgressMessageHTML(msg, card)
+						toolTraceSent = true
+					}
+				}
+				if !agentTraceSent {
+					if card := presentation.RenderTelegramAgentTraceCard(toolTraceSteps); strings.TrimSpace(card) != "" {
+						h.sendProgressMessageHTML(msg, card)
+						agentTraceSent = true
+					}
+				}
+				if evt.Content != "" {
+					finalContent.Reset()
+					finalContent.WriteString(evt.Content)
+				}
+				finalOutput := strings.TrimSpace(finalContent.String())
+				if shouldPrependToolNarratives(h.effectiveShowToolDetailsInResult(), true) && finalOutput != "" {
+					finalOutput = prependToolNarratives(toolNarratives, finalOutput)
+				}
+				h.sendFinalAssistantResponse(msg, presentation.WrapFinalConclusion(finalOutput))
+				return true, true
+
+			case turn.ChatEventError:
+				fmt.Printf("[telegram] chat event error: chatID=%s sessionID=%s err=%v\n", msg.Chat.ID, sessionID, evt.Err)
+				if isTaskTimeoutError(evt.Err) {
+					emitProgress(h.telegramTimeoutFeedback(evt.Err))
+				} else if isTaskCanceledError(evt.Err) {
+					emitProgress("🛑 当前任务已停止")
+				} else {
+					emitProgress(telegramChatErrorFeedback(evt.Err))
+				}
+				return true, true
+			}
+			return false, false
+		},
+	)
+
+	if !sentResult {
+		switch {
+		case errors.Is(chatCtx.Err(), context.DeadlineExceeded):
+			emitProgress(h.telegramTimeoutFeedback(context.DeadlineExceeded))
+		case errors.Is(chatCtx.Err(), context.Canceled):
+			emitProgress("🛑 当前任务已停止")
+		default:
+			emitProgress("❌ 请求在返回完整结果前中断，请稍后重试。")
+		}
+	}
+
+	return nil
+}
+
+// handleChatStream 流式对话处理（Telegram 专用）
+func (h *Handler) handleChatStream(ctx context.Context, sender gateway.StreamSender, msg *gateway.Message, input agent.UserTurnInput, sessionID string) error {
+	routingText := input.RoutingText
+	emitProgress := h.newProgressCardUpdater(msg)
+	// 启动 typing indicator（每 5 秒刷新一次，直到完成）
+	typingCtx, typingCancel := context.WithCancel(context.Background())
+	defer typingCancel()
+	go h.adapter.SendTypingLoop(typingCtx, msg.Chat.ID)
+
+	chatCtx, chatCancel := context.WithTimeout(ctx, h.effectiveChatStreamTimeout())
+	defer chatCancel()
+
+	events, err := h.openTurnChatEventStream(chatCtx, telegramConversationScope(msg), input, sessionID)
+	if err != nil {
+		if isTaskTimeoutError(err) {
+			sender.SetResult(h.telegramTimeoutFeedback(err))
+			sender.Finish()
+			return nil
+		}
+		if isTaskCanceledError(err) {
+			sender.SetResult("🛑 当前任务已停止")
+			sender.Finish()
+			return nil
+		}
+		sender.SetResult(telegramChatErrorFeedback(err))
+		sender.Finish()
+		return nil
+	}
+
+	var finalContent strings.Builder
+	toolCallCount := 0
+	lastProgress := ""
+	var toolNarratives []string
+	var toolTraceSteps []presentation.TelegramToolTraceStep
+	toolTraceSent := false
+	agentTraceSent := false
+	var memoryTraceCards []memory.SearchTrace
+	memoryTraceSent := false
+	narrativeMode := h.effectiveProgressAsMessages() && h.effectiveProgressAsNaturalLanguage()
+	summaryMode := narrativeMode && h.effectiveProgressSummaryWithLLM()
+	currentRound := 1
+	var roundObservations []string
+	var progressHistory []string
+
+	sentResult := runTurnChatEventLoop(
+		chatCtx,
+		events,
+		func(err error) bool {
+			if errors.Is(err, context.DeadlineExceeded) {
+				sender.SetResult(h.telegramTimeoutFeedback(context.DeadlineExceeded))
+			} else {
+				sender.SetResult("🛑 当前任务已停止")
+			}
+			sender.Finish()
+			return true
+		},
+		func(evt turn.ChatEvent) (bool, bool) {
+			switch evt.Type {
+			case turn.ChatEventObservation:
+				h.sendTurnComputerObservation(chatCtx, msg, evt.Observation)
+
+			case turn.ChatEventThinking:
+				if summaryMode {
+					if nextRound := presentation.ExtractRoundNumber(evt.Content); nextRound > currentRound {
+						if progress := h.generateRoundProgressFeedback(chatCtx, msg, routingText, currentRound, roundObservations, progressHistory, lastProgress); progress != "" {
+							emitProgress(formatTelegramProgressSummary(progress))
+							lastProgress = progress
+							appendProgressHistory(&progressHistory, progress)
+						}
+						roundObservations = nil
+						currentRound = nextRound
+					}
+				} else if h.effectiveProgressAsMessages() && toolCallCount == 0 && lastProgress == "" {
+					progress := "🧠 " + presentation.ClipOneLine(evt.Content, 180)
+					if narrativeMode {
+						progress = presentation.HumanizeThinkingProgress(evt.Content)
+					}
+					if strings.TrimSpace(progress) != "" && progress != "🧠 " && progress != lastProgress {
+						emitProgress(progress)
+						lastProgress = progress
+					}
+				} else {
+					// 兼容旧模式：在同一条消息里更新思考前缀
+					sender.SetThinking(evt.Content)
+				}
+
+			case turn.ChatEventApprovalRequired:
+				emitProgress(formatGatewayApprovalPrompt(evt))
+
+			case turn.ChatEventToolCall:
+				toolCallCount++
+				toolTraceSteps = append(toolTraceSteps, presentation.TelegramToolTraceStep{
+					Name: evt.Name,
+					Args: evt.Args,
+				})
+				if summaryMode {
+					if line := presentation.HumanizeToolCall(evt.Name, evt.Args); line != "" && len(roundObservations) < 2 {
+						roundObservations = append(roundObservations, "Tool call: "+line)
+					}
+				} else if h.effectiveProgressAsMessages() && toolCallCount == 1 {
+					// 工具调用作为独立自然语言消息发送（Nanobot 风格）。
+					progress := "🔧 " + presentation.HumanizeToolCall(evt.Name, evt.Args)
+					if narrativeMode {
+						progress = presentation.HumanizeToolCallProgress(1, evt.Name, evt.Args)
+					}
+					if strings.TrimSpace(progress) != "" && progress != lastProgress {
+						emitProgress(progress)
+						lastProgress = progress
+					}
+				} else {
+					// 兼容旧模式：显示工具调用标签
+					sender.SetToolCall(evt.Name, evt.Args)
+				}
+
+			case turn.ChatEventToolResult:
+				if evt.Name == telegramMemoryTraceEventName {
+					if h.effectiveMemoryTrace() {
+						if trace, ok := presentation.ParseTelegramMemoryTracePayload(evt.Result); ok {
+							memoryTraceCards = append(memoryTraceCards, trace)
+						}
+					}
+					break
+				}
+				if evt.Name == "delegate_task" {
+					h.observeDelegateToolResult(msg, evt.Result)
+				}
+				if len(toolTraceSteps) > 0 {
+					for i := len(toolTraceSteps) - 1; i >= 0; i-- {
+						if toolTraceSteps[i].Name == evt.Name && toolTraceSteps[i].Result == "" {
+							toolTraceSteps[i].Result = evt.Result
+							toolTraceSteps[i].Success = !strings.HasPrefix(strings.ToLower(strings.TrimSpace(evt.Result)), "error:")
+							break
+						}
+					}
+				}
+				if shouldPrependToolNarratives(h.effectiveShowToolDetailsInResult(), narrativeMode) {
+					if line := presentation.HumanizeToolResult(evt.Name, evt.Result); line != "" {
+						toolNarratives = append(toolNarratives, line)
+					}
+				}
+				if !summaryMode && !h.effectiveProgressAsMessages() {
+					// 兼容旧模式：工具结果后切回思考态
+					sender.SetThinking(fmt.Sprintf("Continuing... (%d tools used)", toolCallCount))
+				}
+
+			case turn.ChatEventContent:
+				// 内容流式追加
+				finalContent.WriteString(evt.Content)
+				if !narrativeMode {
+					sender.Append(evt.Content)
+				}
+
+			case turn.ChatEventDone:
+				if summaryMode {
+					h.flushRoundProgress(chatCtx, msg, routingText, currentRound, roundObservations, &progressHistory, &lastProgress)
+					roundObservations = nil
+				}
+				if !memoryTraceSent {
+					h.sendMemoryTraceCards(msg, memoryTraceCards)
+					memoryTraceSent = true
+				}
+				if narrativeMode && !toolTraceSent {
+					if card := presentation.RenderTelegramToolTraceCardWithTemplateDetails(toolTraceSteps, h.effectiveShowToolDetailsInResult(), h.toolTraceTemplates); strings.TrimSpace(card) != "" {
+						h.sendProgressMessageHTML(msg, card)
+						toolTraceSent = true
+					}
+				}
+				if narrativeMode && !agentTraceSent {
+					if card := presentation.RenderTelegramAgentTraceCard(toolTraceSteps); strings.TrimSpace(card) != "" {
+						h.sendProgressMessageHTML(msg, card)
+						agentTraceSent = true
+					}
+				}
+				if evt.Content != "" {
+					finalContent.Reset()
+					finalContent.WriteString(evt.Content)
+				}
+				finalOutput := finalContent.String()
+				if shouldPrependToolNarratives(h.effectiveShowToolDetailsInResult(), narrativeMode) {
+					finalOutput = prependToolNarratives(toolNarratives, finalOutput)
+				}
+				if narrativeMode {
+					finalOutput = presentation.WrapFinalConclusion(finalOutput)
+				}
+				textOnly, media, resolveErr := resolveOutboundMediaResponse(finalOutput)
+				if resolveErr != nil {
+					sender.SetResult(fmt.Sprintf("❌ Error: %s", utils.TruncateKeepLength(resolveErr.Error(), 200)))
+					sender.Finish()
+					return true, true
+				}
+				textOnly, media = prepareOutboundMediaResponse(textOnly, media)
+				if len(media) > 0 {
+					placeholder := textOnly
+					if strings.TrimSpace(placeholder) == "" {
+						placeholder = summarizeOutboundMedia(media)
+					}
+					sender.SetResult(placeholder)
+					sender.Finish()
+					if err := h.sendAssistantMedia(context.Background(), msg, media); err != nil {
+						h.sendProgressMessage(msg, fmt.Sprintf("❌ Failed to send media response: %s", utils.TruncateKeepLength(err.Error(), 200)))
+					}
+					return true, true
+				}
+				// 最终结果替换整个消息
+				sender.SetResult(textOnly)
+				sender.Finish()
+				return true, true
+
+			case turn.ChatEventError:
+				fmt.Printf("[telegram] chat event error: chatID=%s sessionID=%s err=%v\n", msg.Chat.ID, sessionID, evt.Err)
+				if isTaskTimeoutError(evt.Err) {
+					sender.SetResult(h.telegramTimeoutFeedback(evt.Err))
+					sender.Finish()
+					return true, true
+				}
+				if isTaskCanceledError(evt.Err) {
+					sender.SetResult("🛑 当前任务已停止")
+					sender.Finish()
+					return true, true
+				}
+				sender.SetResult(telegramChatErrorFeedback(evt.Err))
+				sender.Finish()
+				return true, true
+			}
+			return false, false
+		},
+	)
+
+	if !sentResult {
+		switch {
+		case errors.Is(chatCtx.Err(), context.DeadlineExceeded):
+			sender.SetResult(h.telegramTimeoutFeedback(context.DeadlineExceeded))
+		case errors.Is(chatCtx.Err(), context.Canceled):
+			sender.SetResult("🛑 当前任务已停止")
+		default:
+			sender.SetResult("❌ Error: stream ended unexpectedly, please retry")
+		}
+		sender.Finish()
+	}
+
+	return nil
+}
+
+func prependToolNarratives(lines []string, finalOutput string) string {
+	if len(lines) == 0 {
+		return finalOutput
+	}
+	seen := make(map[string]struct{}, len(lines))
+	summaryLines := make([]string, 0, min(8, len(lines)))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		summaryLines = append(summaryLines, line)
+		if len(summaryLines) >= 8 {
+			break
+		}
+	}
+	if len(summaryLines) == 0 {
+		return finalOutput
+	}
+
+	var b strings.Builder
+	b.WriteString("过程摘要：\n||")
+	b.WriteString("我刚刚先做了这些事：\n")
+	for _, line := range summaryLines {
+		b.WriteString("1. ")
+		b.WriteString(presentation.ClipOneLine(line, 120))
+		b.WriteString("\n")
+	}
+	if len(lines) > len(summaryLines) {
+		b.WriteString("1. 还有更多中间步骤，已省略\n")
+	}
+	b.WriteString("||")
+	b.WriteString("\n")
+	b.WriteString(strings.TrimSpace(finalOutput))
+	return b.String()
+}
+
+// handleChatSync 非流式对话处理（回退方案）
+func (h *Handler) handleChatSync(ctx context.Context, msg *gateway.Message, input agent.UserTurnInput, sessionID string) error {
+	if recorder := h.routeRecorder(); recorder != nil {
+		recorder.RecordRecentChatTarget("telegram", msg.Chat.ID, msg.ID)
+	}
+	// 启动 typing indicator
+	typingCtx, typingCancel := context.WithCancel(context.Background())
+	defer typingCancel()
+	go h.adapter.SendTypingLoop(typingCtx, msg.Chat.ID)
+
+	chat := h.chatService()
+	if chat == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Chat runtime unavailable")
+	}
+	response, err := chatWithSessionTurn(ctx, chat, sessionID, input)
+	if err != nil {
+		// If session is broken, try with a fresh session
+		if strings.Contains(err.Error(), "session not found") {
+			scope := telegramConversationScope(msg)
+			h.resetSession(scope)
+			sessionID = h.getSessionID(scope)
+			response, err = chatWithSessionTurn(ctx, chat, sessionID, input)
+		}
+		if err != nil {
+			if isTaskTimeoutError(err) {
+				return h.adapter.Send(ctx, msg.Chat.ID, h.telegramTimeoutFeedback(err))
+			}
+			if isTaskCanceledError(err) {
+				return h.adapter.Send(context.Background(), msg.Chat.ID, "🛑 当前任务已停止")
+			}
+			return h.adapter.Send(ctx, msg.Chat.ID, telegramChatErrorFeedback(err))
+		}
+	}
+
+	return h.sendAssistantResponse(ctx, msg, response)
+}
+
+// handleModel shows or sets the current model.
+func (h *Handler) handleModel(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	if unified, ok := state.(unifiedModelRuntime); ok {
+		return h.handleUnifiedModel(ctx, msg, unified)
+	}
+	if msg.Args == "" {
+		cfg := h.configSnapshot()
+		routerNote := ""
+		if cfg.ModelRouterEnabled {
+			routerNote = "\nModel router is enabled; future turns may still route by task."
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("Current configured model: %s (provider: %s)%s", cfg.Model, cfg.Provider, routerNote))
+	}
+
+	modelID := strings.TrimSpace(msg.Args)
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Model switching unavailable")
+	}
+	mutable, canSave := state.Config().(mutableAgentConfigProvider)
+	var settings appservice.MutableSettings
+	if canSave {
+		settings = mutable
+	}
+	persisted, err := appservice.SwitchLegacyModel(state, settings, modelID)
+	if err != nil {
+		failure := err.(*appservice.ModelSwitchError)
+		switch failure.Stage {
+		case "provider":
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("⚠️ Switched runtime model to `%s`, but failed to update provider config: %s", modelID, err))
+		case "model":
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("⚠️ Switched runtime model to `%s`, but failed to update config: %s", modelID, err))
+		case "save":
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("⚠️ Switched runtime model to `%s`, but failed to save config: %s", modelID, err))
+		default:
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Failed to switch model: %s", err))
+		}
+	}
+	if persisted {
+		routerNote := ""
+		if mutable.Get().ModelRouterEnabled {
+			routerNote = "\nModel router is enabled; future turns may still route by task."
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Switched model: `%s`\nSaved to config.%s", modelID, routerNote))
+	}
+
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Switched runtime model: `%s`\nThis config provider does not support saving, so restart may restore the configured model.", modelID))
+}
+
+func (h *Handler) handleUnifiedModel(ctx context.Context, msg *gateway.Message, state unifiedModelRuntime) error {
+	args := strings.Fields(strings.TrimSpace(msg.Args))
+	if len(args) == 0 {
+		lines := []string{"*Current models*"}
+		for _, kind := range config.ModelKinds() {
+			if current, ok := state.CurrentModel(kind); ok {
+				providerName := current.Provider
+				if providerName == "" {
+					providerName = "default"
+				}
+				lines = append(lines, fmt.Sprintf("• `%s`: `%s` (%s)", kind, current.ID, providerName))
+			}
+		}
+		if h.configSnapshot().ModelRouterEnabled {
+			lines = append(lines, "\nModel router is enabled; chat requests may be routed by task complexity.")
+		}
+		lines = append(lines, "\nUse `/model <kind> <id>` to switch, or `/model <id>` for chat compatibility.")
+		return h.adapter.Send(ctx, msg.Chat.ID, strings.Join(lines, "\n"))
+	}
+
+	if strings.EqualFold(args[0], "profile") {
+		if len(args) == 1 || strings.EqualFold(args[1], "list") {
+			profiles := state.ModelProfiles()
+			if len(profiles) == 0 {
+				return h.adapter.Send(ctx, msg.Chat.ID, "No model profiles are configured.")
+			}
+			names := make([]string, 0, len(profiles))
+			for name := range profiles {
+				names = append(names, name)
+			}
+			slices.Sort(names)
+			return h.adapter.Send(ctx, msg.Chat.ID, "*Model profiles*\n• `"+strings.Join(names, "`\n• `")+"`")
+		}
+		if len(args) != 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: `/model profile [list|name]`")
+		}
+		if err := state.ApplyModelProfile(args[1]); err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Failed to apply profile: %s", err))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Applied model profile `%s`.", args[1]))
+	}
+
+	if strings.EqualFold(args[0], "router") {
+		if len(args) == 1 || strings.EqualFold(args[1], "show") {
+			enabled := h.configSnapshot().ModelRouterEnabled
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("Model router: `%t`\nUse the Configuration Center or `lh config set model_router.enable <true|false>` to change routing.", enabled))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, "Router changes are available in the Configuration Center; they are intentionally not applied from a chat command without reviewing the full routing policy.")
+	}
+
+	pinned := false
+	filtered := args[:0]
+	for _, arg := range args {
+		if arg == "--pin" {
+			pinned = true
+			continue
+		}
+		filtered = append(filtered, arg)
+	}
+	args = filtered
+	if len(args) == 0 || len(args) > 2 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: `/model [chat|vision|embedding|transcription|image|tts|reranker] <id> [--pin]`")
+	}
+
+	kind := config.ModelKindChat
+	modelID := args[0]
+	if len(args) == 2 {
+		parsed, err := config.ParseModelKind(args[0])
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err))
+		}
+		kind = parsed
+		modelID = args[1]
+	}
+	if err := appservice.NewModels(state).Switch(kind, modelID, agent.SwitchModelOptions{Persist: true, Pin: pinned}); err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Failed to switch %s model: %s", kind, err))
+	}
+	note := ""
+	if kind == config.ModelKindChat && h.configSnapshot().ModelRouterEnabled {
+		note = "\nModel router is enabled; future turns may still route by task complexity."
+	}
+	if pinned {
+		note += "\n`--pin` is accepted for compatible clients; this gateway currently reports the configured global selection."
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Switched `%s` model to `%s` and saved it to config.%s", kind, modelID, note))
+}
+
+func (h *Handler) handleReview(ctx context.Context, msg *gateway.Message) error {
+	var sb strings.Builder
+	sb.WriteString("🔎 *Workspace Review:*\n\n")
+	if wd, err := os.Getwd(); err == nil {
+		sb.WriteString(fmt.Sprintf("• Workspace: `%s`\n", wd))
+	}
+	cfg := h.configSnapshot()
+	sb.WriteString(fmt.Sprintf("• Provider: %s\n", valueOrUnset(cfg.Provider)))
+	sb.WriteString(fmt.Sprintf("• Model: %s\n", valueOrUnset(cfg.Model)))
+
+	sb.WriteString("\n*Git Status:*\n")
+	status := readGitSnippet("status", "--short", "--branch")
+	if status == "" {
+		sb.WriteString("clean or unavailable\n")
+	} else {
+		sb.WriteString(status)
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("\n*Recent Commits:*\n")
+	log := readGitSnippet("log", "--oneline", "--decorate=short", "-n", "5")
+	if log == "" {
+		sb.WriteString("unavailable\n")
+	} else {
+		sb.WriteString(log)
+		sb.WriteString("\n")
+	}
+
+	if sessions := h.sessionManager(); sessions != nil {
+		infos := sessions.ListInfo()
+		sb.WriteString(fmt.Sprintf("\n*Recent Sessions:* %d\n", len(infos)))
+		limit := min(len(infos), 5)
+		for i := 0; i < limit; i++ {
+			title := strings.TrimSpace(infos[i].Title)
+			if title == "" {
+				title = "(untitled)"
+			}
+			sb.WriteString(fmt.Sprintf("• %s (%d msgs)\n", truncateForTelegramList(title, 56), infos[i].MessageCount))
+		}
+	}
+
+	return h.adapter.Send(ctx, msg.Chat.ID, strings.TrimSpace(sb.String()))
+}
+
+func readGitSnippet(args ...string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	limit := min(len(lines), 12)
+	return strings.Join(lines[:limit], "\n")
+}
+
+func (h *Handler) handleInit(ctx context.Context, msg *gateway.Message) error {
+	cfg := h.configSnapshot()
+	var sb strings.Builder
+	sb.WriteString("🍀 *LuckyAgent Init Status:*\n\n")
+	sb.WriteString(fmt.Sprintf("• Home: `%s`\n", valueOrUnset(cfg.HomeDir)))
+	sb.WriteString(fmt.Sprintf("• Config: `%s`\n", valueOrUnset(cfg.ConfigFile)))
+	sb.WriteString(fmt.Sprintf("• Provider: %s\n", valueOrUnset(cfg.Provider)))
+	sb.WriteString(fmt.Sprintf("• Model: %s\n", valueOrUnset(cfg.Model)))
+	if cfg.APIKey == "" {
+		sb.WriteString("\nAPI key is not configured. Run `lh config set api_key <key>` on the host.")
+	} else {
+		sb.WriteString(fmt.Sprintf("\nAPI key: %s", maskSecret(cfg.APIKey)))
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+}
+
+func (h *Handler) handleConfig(ctx context.Context, msg *gateway.Message) error {
+	args := strings.Fields(strings.TrimSpace(msg.Args))
+	if len(args) == 0 || args[0] == "list" {
+		return h.sendConfigList(ctx, msg)
+	}
+	if args[0] == "get" {
+		if len(args) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /config get <key>")
+		}
+		value, ok := configSnapshotValue(h.configSnapshot(), args[1])
+		if !ok {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("`%s` is not exposed in Telegram config view.", args[1]))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("%s = %s", args[1], value))
+	}
+	if len(args) == 1 {
+		value, ok := configSnapshotValue(h.configSnapshot(), args[0])
+		if ok {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("%s = %s", args[0], value))
+		}
+	}
+	if args[0] == "set" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Config writes from Telegram are disabled. Run `lh config set <key> <value>` on the host.")
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /config [list|get <key>]")
+}
+
+func (h *Handler) sendConfigList(ctx context.Context, msg *gateway.Message) error {
+	cfg := h.configSnapshot()
+	info := fmt.Sprintf("⚙️ *Configuration:*\n\n• provider: %s\n• api_key: %s\n• api_base: %s\n• model: %s\n• soul_path: `%s`\n• max_tokens: %d\n• temperature: %.1f\n• server.addr: %s\n• msg_gateway.platform: %s\n• msg_gateway.api_addr: %s\n• msg_gateway.telegram.token: %s",
+		valueOrUnset(cfg.Provider),
+		maskSecret(cfg.APIKey),
+		valueOrUnset(cfg.APIBase),
+		valueOrUnset(cfg.Model),
+		valueOrUnset(cfg.SoulPath),
+		cfg.MaxTokens,
+		cfg.Temperature,
+		valueOrUnset(cfg.ServerAddr),
+		valueOrUnset(cfg.MsgGatewayPlatform),
+		valueOrUnset(cfg.MsgGatewayAPIAddr),
+		maskSecret(cfg.MsgGatewayTelegramToken),
+	)
+	return h.adapter.Send(ctx, msg.Chat.ID, info)
+}
+
+func configSnapshotValue(cfg agentConfigSnapshot, key string) (string, bool) {
+	switch key {
+	case "home", "home_dir":
+		return valueOrUnset(cfg.HomeDir), true
+	case "config", "config_file":
+		return valueOrUnset(cfg.ConfigFile), true
+	case "provider":
+		return valueOrUnset(cfg.Provider), true
+	case "api_key":
+		return maskSecret(cfg.APIKey), true
+	case "api_base":
+		return valueOrUnset(cfg.APIBase), true
+	case "model":
+		return valueOrUnset(cfg.Model), true
+	case "soul_path":
+		return valueOrUnset(cfg.SoulPath), true
+	case "max_tokens":
+		return strconv.Itoa(cfg.MaxTokens), true
+	case "temperature":
+		return fmt.Sprintf("%.1f", cfg.Temperature), true
+	case "server.addr":
+		return valueOrUnset(cfg.ServerAddr), true
+	case "msg_gateway.platform":
+		return valueOrUnset(cfg.MsgGatewayPlatform), true
+	case "msg_gateway.api_addr":
+		return valueOrUnset(cfg.MsgGatewayAPIAddr), true
+	case "msg_gateway.telegram.token":
+		return maskSecret(cfg.MsgGatewayTelegramToken), true
+	case "msg_gateway.telegram.proxy":
+		return valueOrUnset(cfg.MsgGatewayTelegramProxy), true
+	case "msg_gateway.telegram.memory_trace":
+		return strconv.FormatBool(cfg.MemoryTrace), true
+	case "msg_gateway.telegram.memory_trace_level":
+		return valueOrUnset(cfg.MemoryTraceLevel), true
+	case "msg_gateway.telegram.memory_trace_max_results":
+		return strconv.Itoa(cfg.MemoryTraceMaxResults), true
+	case "msg_gateway.telegram.memory_trace_max_hops":
+		return strconv.Itoa(cfg.MemoryTraceMaxHops), true
+	default:
+		return "", false
+	}
+}
+
+func (h *Handler) handleVersion(ctx context.Context, msg *gateway.Message) error {
+	version, commit, date := buildInfo()
+	info := fmt.Sprintf("🍀 *LuckyAgent Version:*\n\n• Version: %s\n• Commit: %s\n• Date: %s\n• Go: %s\n• OS/Arch: %s/%s",
+		version,
+		commit,
+		date,
+		runtime.Version(),
+		runtime.GOOS,
+		runtime.GOARCH,
+	)
+	return h.adapter.Send(ctx, msg.Chat.ID, info)
+}
+
+func (h *Handler) handleSetSandbox(ctx context.Context, msg *gateway.Message) error {
+	runtime, ok := h.agent.(sandboxRuntime)
+	if !ok {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Sandbox controls are unavailable")
+	}
+	mode := strings.ToLower(strings.TrimSpace(msg.Args))
+	if mode == "" || mode == "status" {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("当前沙箱模式：%s\n用法：/set dev 或 /set iso", runtime.SandboxMode()))
+	}
+	if err := runtime.SetSandboxMode(mode); err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ "+err.Error())
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ 沙箱模式已切换为 %s。新任务使用新模式，运行中的任务保持原模式。", runtime.SandboxMode()))
+}
+
+func buildInfo() (version, commit, date string) {
+	version = "dev"
+	commit = "unknown"
+	date = "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if strings.TrimSpace(info.Main.Version) != "" && info.Main.Version != "(devel)" {
+			version = info.Main.Version
+		}
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if setting.Value != "" {
+					commit = setting.Value
+				}
+			case "vcs.time":
+				if setting.Value != "" {
+					date = setting.Value
+				}
+			}
+		}
+	}
+	return version, commit, date
+}
+
+func (h *Handler) handleModels(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Model discovery unavailable")
+	}
+	if unified, ok := state.(unifiedModelRuntime); ok && !strings.EqualFold(strings.TrimSpace(msg.Args), "refresh") {
+		return h.handleUnifiedModels(ctx, msg, unified)
+	}
+	refresh := strings.EqualFold(strings.TrimSpace(msg.Args), "refresh")
+	if strings.TrimSpace(msg.Args) != "" && !refresh {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: `/models [refresh]`")
+	}
+	cfg := h.configSnapshot()
+	models, source, err := h.discoverModels(ctx, cfg, refresh)
+	if err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, telegramModelDiscoveryError(err))
+	}
+	if catalog := state.Catalog(); catalog != nil {
+		for _, model := range models {
+			catalog.Register(model)
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📋 *Available Models* (%d, %s):\n\n", len(models), source))
+	limit := min(len(models), 40)
+	for i := 0; i < limit; i++ {
+		m := models[i]
+		marker := "•"
+		if m.ID == cfg.Model {
+			marker = "✅"
+		}
+		sb.WriteString(fmt.Sprintf("%s `%s` — %s\n", marker, m.ID, truncateForTelegramList(m.DisplayName, 48)))
+	}
+	if len(models) > limit {
+		sb.WriteString(fmt.Sprintf("\n... and %d more", len(models)-limit))
+	}
+	sb.WriteString("\n\nUse `/model <id>` to switch. Use `/models refresh` to query again.")
+	return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+}
+
+func (h *Handler) handleUnifiedModels(ctx context.Context, msg *gateway.Message, state unifiedModelRuntime) error {
+	args := strings.Fields(strings.TrimSpace(msg.Args))
+	var kind *config.ModelKind
+	providerName := ""
+	if len(args) == 1 && !strings.EqualFold(args[0], "all") {
+		parsed, err := config.ParseModelKind(args[0])
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: `/models [all|chat|vision|embedding|transcription|image|tts|reranker|provider <name>|refresh]`")
+		}
+		kind = &parsed
+	} else if len(args) == 2 && strings.EqualFold(args[0], "provider") {
+		providerName = args[1]
+	} else if len(args) > 0 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: `/models [all|chat|vision|embedding|transcription|image|tts|reranker|provider <name>|refresh]`")
+	}
+
+	models := appservice.NewModels(state).List(ctx, appservice.ModelQuery{Kind: kind, Provider: providerName}).Models
+	if len(models) == 0 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "No configured models match this filter.")
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📋 *Models* (%d):\n\n", len(models)))
+	limit := min(len(models), 40)
+	for index := 0; index < limit; index++ {
+		model := models[index]
+		marker := "•"
+		if model.Current {
+			marker = "✅"
+		}
+		display := model.DisplayName
+		if display == "" {
+			display = model.Provider
+		}
+		if display == "" {
+			display = "configured"
+		}
+		sb.WriteString(fmt.Sprintf("%s `%s` · %s · %s\n", marker, model.ID, model.Kind, truncateForTelegramList(display, 40)))
+	}
+	if len(models) > limit {
+		sb.WriteString(fmt.Sprintf("\n... and %d more", len(models)-limit))
+	}
+	sb.WriteString("\nUse `/model <kind> <id>` to switch. Use `/models refresh` to query the chat provider again.")
+	return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+}
+
+func (h *Handler) discoverModels(ctx context.Context, cfg agentConfigSnapshot, refresh bool) ([]provider.ModelInfo, string, error) {
+	discovery := h.modelDiscovery
+	if discovery == nil {
+		discovery = provider.NewModelDiscovery()
+		h.mu.Lock()
+		if h.modelDiscovery == nil {
+			h.modelDiscovery = discovery
+		} else {
+			discovery = h.modelDiscovery
+		}
+		h.mu.Unlock()
+	}
+	models, err := discovery.Discover(ctx, provider.ModelDiscoveryConfig{
+		Provider:     cfg.Provider,
+		APIKey:       cfg.APIKey,
+		APIBase:      cfg.APIBase,
+		Model:        cfg.Model,
+		ExtraHeaders: cfg.ExtraHeaders,
+	}, refresh)
+	if err == nil {
+		return models, "verified by current credentials", nil
+	}
+	if !errors.Is(err, provider.ErrModelDiscoveryUnsupported) {
+		return nil, "", err
+	}
+	manual := configuredModelsForProvider(cfg)
+	if len(manual) == 0 {
+		return nil, "", err
+	}
+	return manual, "manual configuration (provider has no model-list API)", nil
+}
+
+func configuredModelsForProvider(cfg agentConfigSnapshot) []provider.ModelInfo {
+	models := make([]provider.ModelInfo, 0, len(cfg.CustomModels)+1)
+	providerName := strings.TrimSpace(cfg.Provider)
+	for _, model := range cfg.CustomModels {
+		if strings.EqualFold(strings.TrimSpace(model.Provider), providerName) && strings.TrimSpace(model.ID) != "" {
+			models = append(models, model)
+		}
+	}
+	if currentModel := strings.TrimSpace(cfg.Model); currentModel != "" {
+		found := false
+		for _, model := range models {
+			if model.ID == currentModel {
+				found = true
+				break
+			}
+		}
+		if !found {
+			models = append(models, provider.ModelInfo{ID: currentModel, Provider: providerName, DisplayName: currentModel})
+		}
+	}
+	slices.SortFunc(models, func(left, right provider.ModelInfo) int { return strings.Compare(left.ID, right.ID) })
+	return models
+}
+
+func telegramModelDiscoveryError(err error) string {
+	var discoveryErr *provider.ModelDiscoveryError
+	if errors.As(err, &discoveryErr) {
+		switch discoveryErr.Kind {
+		case provider.ModelDiscoveryAuthentication:
+			return "❌ Could not list models: authentication failed. Check the active provider credentials."
+		case provider.ModelDiscoveryRateLimited:
+			return "❌ Could not list models: provider rate limit reached. Try `/models refresh` later."
+		case provider.ModelDiscoveryUnsupported:
+			return "❌ This provider does not expose a model-list API. Configure `custom_models` to list manually configured models."
+		case provider.ModelDiscoveryNetwork:
+			return "❌ Could not reach the provider model-list endpoint. Check the configured API base and network."
+		default:
+			return "❌ Could not list models: the provider returned an invalid or unsupported response."
+		}
+	}
+	return "❌ Could not list models. Check the active provider configuration."
+}
+
+// handleSoul shows the current SOUL info.
+func (h *Handler) handleSoul(ctx context.Context, msg *gateway.Message) error {
+	if h.state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "No SOUL configured.")
+	}
+	s := h.state.Soul()
+	if s == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "No SOUL configured.")
+	}
+
+	prompt := s.SystemPrompt()
+	if len(prompt) > 500 {
+		prompt = prompt[:500] + "..."
+	}
+
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("🧠 *Current SOUL:*\n\n%s", prompt))
+}
+
+// handleTools lists available tools with pagination.
+func (h *Handler) handleTools(ctx context.Context, msg *gateway.Message) error {
+	tools := h.tools()
+	if tools == nil {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Tool registry unavailable.</b>")
+	}
+	allTools := tools.List()
+
+	if len(allTools) == 0 {
+		return h.sendCommandHTML(ctx, msg, "No tools available.")
+	}
+
+	page, showAll, err := presentation.ParseTelegramListPage(msg.Args)
+	if err != nil {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Usage:</b> <code>/tools [page|all]</code>")
+	}
+	formatter := TelegramFormatter{}
+	if !showAll {
+		return h.sendCommandHTML(ctx, msg, formatter.FormatToolsList(allTools, page))
+	}
+	for page = 1; page <= (len(presentation.OrderedTelegramTools(allTools))+presentation.TelegramCommandListPageSize-1)/presentation.TelegramCommandListPageSize; page++ {
+		if err := h.sendCommandHTML(ctx, msg, formatter.FormatToolsList(allTools, page)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Handler) handleTool(ctx context.Context, msg *gateway.Message) error {
+	name := strings.TrimSpace(msg.Args)
+	if name == "" {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Usage:</b> <code>/tool &lt;name&gt;</code>")
+	}
+	tools := h.tools()
+	if tools == nil {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Tool registry unavailable.</b>")
+	}
+	for _, item := range tools.List() {
+		if item != nil && strings.EqualFold(item.Name, name) {
+			return h.sendCommandHTML(ctx, msg, (TelegramFormatter{}).FormatToolDetail(item))
+		}
+	}
+	return h.sendCommandHTML(ctx, msg, fmt.Sprintf("❌ Tool <code>%s</code> not found. Use <code>/tools</code> to list available tools.", presentation.EscapeTelegramCommandHTML(name)))
+}
+
+// handleReset resets the conversation for this chat.
+func (h *Handler) handleReset(ctx context.Context, msg *gateway.Message) error {
+	newID := h.resetSession(telegramConversationScope(msg))
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("🔄 Conversation reset. New session: `%s`", shortSessionID(newID)))
+}
+
+// handleHistory shows the conversation history for this chat.
+func (h *Handler) handleHistory(ctx context.Context, msg *gateway.Message) error {
+	sessionID := h.getSessionID(telegramConversationScope(msg))
+
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "No conversation history.")
+	}
+	sess, ok := sessions.Get(sessionID)
+	if !ok {
+		return h.adapter.Send(ctx, msg.Chat.ID, "No conversation history.")
+	}
+
+	messages := sess.GetMessages()
+	if len(messages) == 0 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "No messages in this session yet.")
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📜 *History* (%d messages):\n\n", len(messages)))
+
+	maxShow := 20
+	start := 0
+	if len(messages) > maxShow {
+		start = len(messages) - maxShow
+		sb.WriteString(fmt.Sprintf("_(showing last %d of %d)_\n\n", maxShow, len(messages)))
+	}
+
+	for i := start; i < len(messages); i++ {
+		m := messages[i]
+		role := ""
+		switch m.Role {
+		case "user":
+			role = "👤"
+		case "assistant":
+			role = "🤖"
+		case "tool":
+			role = "🔧"
+		default:
+			role = "💬"
+		}
+
+		content := m.Content
+		if len(content) > 80 {
+			content = content[:80] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("%s %s\n", role, content))
+	}
+
+	return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+}
+
+// handleSession shows the current session or details for a selected session.
+func (h *Handler) handleSession(ctx context.Context, msg *gateway.Message) error {
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Session manager unavailable.</b>")
+	}
+
+	currentID := h.currentSessionID(telegramConversationScope(msg))
+	query := strings.TrimSpace(msg.Args)
+	if query == "" {
+		if currentID == "" {
+			return h.sendCommandHTML(ctx, msg, "ℹ️ 暂无当前会话。发送一条消息即可开始。")
+		}
+		query = currentID
+	}
+
+	result := appservice.NewSessions(sessions, nil).Find(query, appservice.MatchSessionReference)
+	switch result.Status {
+	case appservice.SessionMatched:
+	case appservice.SessionAmbiguous:
+		return h.sendCommandHTML(ctx, msg, formatAmbiguousSessionSwitchMessage(query, result.Matches))
+	default:
+		return h.sendCommandHTML(ctx, msg, fmt.Sprintf("❌ 会话 <code>%s</code> 不存在。使用 <code>/sessions</code> 查看列表。", presentation.EscapeTelegramCommandHTML(query)))
+	}
+	info, ok := telegramSessionInfoByID(sessions, result.ID)
+	if !ok {
+		return h.sendCommandHTML(ctx, msg, fmt.Sprintf("❌ 会话 <code>%s</code> 不存在。", presentation.EscapeTelegramCommandHTML(query)))
+	}
+	return h.sendCommandHTML(ctx, msg, (TelegramFormatter{}).FormatSessionDetail(info, result.Session, currentID))
+}
+
+// handleSessions lists recent sessions so Telegram users can pick one to resume.
+func (h *Handler) handleSessions(ctx context.Context, msg *gateway.Message) error {
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Session manager unavailable.</b>")
+	}
+
+	infos := sessions.ListInfo()
+	if len(infos) == 0 {
+		return h.sendCommandHTML(ctx, msg, "📭 暂无会话。发送一条消息即可开始。")
+	}
+
+	page, showAll, err := presentation.ParseTelegramListPage(msg.Args)
+	if err != nil {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>用法：</b><code>/sessions [页码|all]</code>")
+	}
+	currentID := h.currentSessionID(telegramConversationScope(msg))
+	formatter := TelegramFormatter{}
+	if !showAll {
+		return h.sendCommandHTML(ctx, msg, formatter.FormatSessionsList(infos, currentID, page))
+	}
+	pageCount := (len(infos) + presentation.TelegramCommandListPageSize - 1) / presentation.TelegramCommandListPageSize
+	for page = 1; page <= pageCount; page++ {
+		if err := h.sendCommandHTML(ctx, msg, formatter.FormatSessionsList(infos, currentID, page)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Handler) handleResume(ctx context.Context, msg *gateway.Message) error {
+	reference := strings.TrimSpace(msg.Args)
+	if reference == "" {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>用法：</b><code>/resume &lt;序号、标题或 ID&gt;</code>")
+	}
+	return h.handleSessionSwitch(ctx, msg, reference)
+}
+
+func (h *Handler) handleRename(ctx context.Context, msg *gateway.Message) error {
+	title := strings.TrimSpace(msg.Args)
+	if title == "" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /rename <title>")
+	}
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Session manager unavailable")
+	}
+	sessionID := h.getSessionID(telegramConversationScope(msg))
+	sess, ok := sessions.Get(sessionID)
+	if !ok || sess == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Current session not found")
+	}
+	if err := appservice.RenameSession(sess, title); err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Failed to rename session: %s", err.Error()))
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Renamed current session to: %s", truncateForTelegramList(title, 120)))
+}
+
+func (h *Handler) handleSessionSwitch(ctx context.Context, msg *gateway.Message, sessionQuery string) error {
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Session manager unavailable")
+	}
+
+	result := appservice.NewSessions(sessions, nil).Find(sessionQuery, appservice.MatchSessionReference)
+	switch result.Status {
+	case appservice.SessionMatched:
+	case appservice.SessionAmbiguous:
+		return h.sendCommandHTML(ctx, msg, formatAmbiguousSessionSwitchMessage(sessionQuery, result.Matches))
+	default:
+		return h.sendCommandHTML(ctx, msg, fmt.Sprintf("❌ 会话 <code>%s</code> 不存在。使用 <code>/sessions</code> 查看列表。", presentation.EscapeTelegramCommandHTML(sessionQuery)))
+	}
+
+	sess := result.Session
+	matchedID := result.ID
+	scope := telegramConversationScope(msg)
+	h.mu.Lock()
+	oldSessionID, hadOld := h.sessions[scope]
+	h.sessions[scope] = matchedID
+	h.mu.Unlock()
+
+	h.saveChatSessions()
+
+	title := telegramSessionDisplayTitle(sess.Title)
+	if hadOld && oldSessionID == matchedID {
+		return h.sendCommandHTML(ctx, msg, fmt.Sprintf("✅ 已在会话 <code>%s</code> — %s", presentation.EscapeTelegramCommandHTML(shortSessionID(matchedID)), presentation.EscapeTelegramCommandHTML(title)))
+	}
+
+	return h.sendCommandHTML(ctx, msg, fmt.Sprintf("✅ <b>已切换会话</b>\n<b>ID：</b><code>%s</code>\n<b>标题：</b>%s\n<b>消息数：</b>%d",
+		presentation.EscapeTelegramCommandHTML(shortSessionID(matchedID)),
+		presentation.EscapeTelegramCommandHTML(title),
+		sess.MessageCount(),
+	))
+}
+
+// handleSkills lists loaded skills with pagination.
+func (h *Handler) handleSkills(ctx context.Context, msg *gateway.Message) error {
+	skills := h.skillsList()
+	if len(skills) == 0 {
+		return h.sendCommandHTML(ctx, msg, "No skills loaded.")
+	}
+
+	page, showAll, err := presentation.ParseTelegramListPage(msg.Args)
+	if err != nil {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Usage:</b> <code>/skills [page|all]</code>")
+	}
+	formatter := TelegramFormatter{}
+	if !showAll {
+		return h.sendCommandHTML(ctx, msg, formatter.FormatSkillsList(skills, page))
+	}
+	for page = 1; page <= (len(presentation.OrderedTelegramSkills(skills))+presentation.TelegramCommandListPageSize-1)/presentation.TelegramCommandListPageSize; page++ {
+		if err := h.sendCommandHTML(ctx, msg, formatter.FormatSkillsList(skills, page)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *Handler) handleSkill(ctx context.Context, msg *gateway.Message) error {
+	name := strings.TrimSpace(msg.Args)
+	if name == "" {
+		return h.sendCommandHTML(ctx, msg, "❌ <b>Usage:</b> <code>/skill &lt;name&gt;</code>")
+	}
+	for _, skill := range h.skillsList() {
+		if skill == nil {
+			continue
+		}
+		if strings.EqualFold(skill.Name, name) {
+			return h.sendCommandHTML(ctx, msg, (TelegramFormatter{}).FormatSkillDetail(skill))
+		}
+		for _, alias := range skill.Aliases {
+			if strings.EqualFold(alias, name) {
+				return h.sendCommandHTML(ctx, msg, (TelegramFormatter{}).FormatSkillDetail(skill))
+			}
+		}
+	}
+	return h.sendCommandHTML(ctx, msg, fmt.Sprintf("❌ Skill <code>%s</code> not found. Use <code>/skills</code> to list loaded skills.", presentation.EscapeTelegramCommandHTML(name)))
+}
+
+func (h *Handler) handleMCP(ctx context.Context, msg *gateway.Message) error {
+	message, err := mcpclient.RunCommand(ctx, h.mcpAdmin, msg.Args)
+	if err != nil {
+		message = "❌ " + err.Error()
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, message)
+}
+
+func (h *Handler) handleApprove(ctx context.Context, msg *gateway.Message) error {
+	return h.handleToolPermission(ctx, msg, tool.PermAuto, "auto-approved")
+}
+
+func (h *Handler) handleDeny(ctx context.Context, msg *gateway.Message) error {
+	return h.handleToolPermission(ctx, msg, tool.PermDeny, "denied")
+}
+
+func (h *Handler) handleToolPermission(ctx context.Context, msg *gateway.Message, perm tool.PermissionLevel, label string) error {
+	name := strings.TrimSpace(msg.Args)
+	if name == "" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /approve <tool> or /deny <tool>")
+	}
+	tools := h.tools()
+	if tools == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Tool registry unavailable")
+	}
+	if err := tools.SetPermissionOverride(name, perm); err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Tool `%s` is now %s.", name, label))
+}
+
+// handleCron manages scheduled tasks.
+func (h *Handler) handleCron(ctx context.Context, msg *gateway.Message) error {
+	engine := h.cronEngine()
+	args := strings.TrimSpace(msg.Args)
+
+	if args == "" || args == "list" {
+		// List all cron jobs
+		jobs := engine.ListJobs()
+		if len(jobs) == 0 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "⏰ No scheduled tasks. Use /cron add <id> <schedule> <prompt>\nExample: /cron add drink-water 每两个小时 提醒我喝水")
+		}
+
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("⏰ *Scheduled Tasks* (%d):\n\n", len(jobs)))
+		for _, job := range jobs {
+			status := "🟢"
+			switch job.Status {
+			case cron.StatusRunning:
+				status = "🔵"
+			case cron.StatusPaused:
+				status = "🟡"
+			case cron.StatusFailed:
+				status = "🔴"
+			}
+			sb.WriteString(fmt.Sprintf("%s %s — %s\n  Schedule: %s | Runs: %d\n", status, job.ID, job.Name, job.Schedule, job.RunCount))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+	}
+
+	parts := strings.Fields(args)
+	if len(parts) < 1 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /cron [list|add|remove|pause|resume]")
+	}
+
+	switch parts[0] {
+	case "add":
+		if len(parts) < 4 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /cron add <id> <schedule> <prompt>\nExample: /cron add drink-water 每两个小时 提醒我喝水")
+		}
+		id := parts[1]
+		scheduleText := parts[2]
+		command := strings.Join(parts[3:], " ")
+		if strings.TrimSpace(command) == "" {
+			return h.adapter.Send(ctx, msg.Chat.ID, "❌ Missing prompt/command for cron job.")
+		}
+		sessionID := h.getSessionID(telegramConversationScope(msg))
+
+		tools := h.tools()
+		if tools == nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, "❌ Cron tools unavailable")
+		}
+		resp, err := tools.Call("cron", map[string]any{
+			"action":              "add",
+			"id":                  id,
+			"schedule":            scheduleText,
+			"mode":                "agent",
+			"command":             command,
+			"platform":            "telegram",
+			"chat_id":             msg.Chat.ID,
+			"reply_to_message_id": msg.ID,
+			"session_id":          sessionID,
+		})
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Failed to add job: %s", err.Error()))
+		}
+
+		var out struct {
+			ID       string `json:"id"`
+			Schedule string `json:"schedule"`
+			Message  string `json:"message"`
+		}
+		if json.Unmarshal([]byte(resp), &out) == nil && strings.TrimSpace(out.ID) != "" {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Job `%s` added.\nSchedule: %s", out.ID, out.Schedule))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, "✅ Cron job added.")
+
+	case "remove":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /cron remove <id>")
+		}
+		tools := h.tools()
+		if tools == nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, "❌ Cron tools unavailable")
+		}
+		if _, err := tools.Call("cron", map[string]any{"action": "remove", "id": parts[1]}); err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Job `%s` removed", parts[1]))
+
+	case "pause":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /cron pause <id>")
+		}
+		tools := h.tools()
+		if tools == nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, "❌ Cron tools unavailable")
+		}
+		if _, err := tools.Call("cron", map[string]any{"action": "pause", "id": parts[1]}); err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("⏸ Job `%s` paused", parts[1]))
+
+	case "resume":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /cron resume <id>")
+		}
+		tools := h.tools()
+		if tools == nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, "❌ Cron tools unavailable")
+		}
+		if _, err := tools.Call("cron", map[string]any{"action": "resume", "id": parts[1]}); err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("▶️ Job `%s` resumed", parts[1]))
+
+	case "start":
+		engine.Start()
+		return h.adapter.Send(ctx, msg.Chat.ID, "▶️ Cron engine started.")
+
+	case "stop":
+		engine.Stop()
+		return h.adapter.Send(ctx, msg.Chat.ID, "⏹ Cron engine stopped.")
+
+	default:
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /cron [list|add|remove|pause|resume|start|stop]")
+	}
+}
+
+func (h *Handler) handleWatch(ctx context.Context, msg *gateway.Message) error {
+	watcher := h.watcherService()
+	if watcher == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Watch runtime unavailable")
+	}
+
+	args := strings.TrimSpace(msg.Args)
+	if args == "" || args == "list" {
+		patterns := watcher.ListPatterns()
+		if len(patterns) == 0 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "📋 No watch patterns. Use /watch add <id> <glob> <interval>")
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("🔍 *Watch Patterns* (%d):\n\n", len(patterns)))
+		for _, p := range patterns {
+			lastCheck := "N/A"
+			if !p.LastCheck.IsZero() {
+				lastCheck = p.LastCheck.Format("2006-01-02 15:04:05")
+			}
+			sb.WriteString(fmt.Sprintf("• `%s` — %s\n  Interval: %s | Last: %s | Result: %s\n",
+				p.ID,
+				truncateForTelegramList(p.Pattern, 80),
+				p.Interval,
+				lastCheck,
+				valueOrUnset(p.LastResult),
+			))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+	}
+
+	parts := strings.Fields(args)
+	if len(parts) == 0 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /watch [list|add|remove|start|stop]")
+	}
+
+	switch parts[0] {
+	case "add":
+		if len(parts) < 4 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /watch add <id> <glob> <interval>\nExample: /watch add logs \"logs/*.log\" 1m")
+		}
+		interval, err := time.ParseDuration(parts[3])
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Invalid interval: %s", err.Error()))
+		}
+		id := parts[1]
+		pattern := parts[2]
+		if err := watcher.AddPattern(id, "Watch: "+id, pattern, pattern, interval, nil); err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Watch `%s` added for `%s` every %s.", id, pattern, interval))
+	case "remove":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /watch remove <id>")
+		}
+		if err := watcher.RemovePattern(parts[1]); err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Watch `%s` removed.", parts[1]))
+	case "start":
+		watcher.Start()
+		return h.adapter.Send(ctx, msg.Chat.ID, "▶️ Watcher started.")
+	case "stop":
+		watcher.Stop()
+		return h.adapter.Send(ctx, msg.Chat.ID, "⏹ Watcher stopped.")
+	default:
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /watch [list|add|remove|start|stop]")
+	}
+}
+
+func (h *Handler) handleMsgGateway(ctx context.Context, msg *gateway.Message) error {
+	parts := strings.Fields(strings.TrimSpace(msg.Args))
+	subcmd := "status"
+	if len(parts) > 0 {
+		subcmd = parts[0]
+	}
+	cfg := h.configSnapshot()
+	switch subcmd {
+	case "status", "":
+		info := fmt.Sprintf("📨 *Message Gateway:*\n\n• platform: %s\n• start_all: %t\n• api_addr: %s\n• telegram.token: %s\n• telegram.proxy: %s\n• qqofficial.app_id: %s\n• qqofficial.sandbox: %t\n• weixin.account_id: %s\n• openclawweixin.account_id: %s\n\nRuntime status is not exposed by the gateway. Check the host terminal that started `lh msg-gateway start`.",
+			valueOrUnset(cfg.MsgGatewayPlatform),
+			cfg.MsgGatewayStartAll,
+			valueOrUnset(cfg.MsgGatewayAPIAddr),
+			maskSecret(cfg.MsgGatewayTelegramToken),
+			valueOrUnset(cfg.MsgGatewayTelegramProxy),
+			valueOrUnset(cfg.MsgGatewayQQAppID),
+			cfg.MsgGatewayQQSandbox,
+			valueOrUnset(cfg.MsgGatewayWeixinAccountID),
+			valueOrUnset(cfg.MsgGatewayOpenClawAccount),
+		)
+		return h.adapter.Send(ctx, msg.Chat.ID, info)
+	case "start", "stop":
+		return h.adapter.Send(ctx, msg.Chat.ID, "Message gateway start/stop from Telegram is disabled. Run `lh msg-gateway start` in the host terminal, and stop it there with Ctrl+C.")
+	default:
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /msg_gateway [status]")
+	}
+}
+
+func (h *Handler) handleRAG(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	if state == nil || state.RAG() == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ RAG system unavailable")
+	}
+	ragMgr := state.RAG()
+	parts := strings.Fields(strings.TrimSpace(msg.Args))
+	if len(parts) == 0 {
+		return h.sendRAGStats(ctx, msg, ragMgr)
+	}
+
+	switch parts[0] {
+	case "stats":
+		return h.sendRAGStats(ctx, msg, ragMgr)
+	case "store":
+		return h.sendRAGStore(ctx, msg, ragMgr)
+	case "list":
+		ids := ragMgr.ListDocuments()
+		if len(ids) == 0 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "📚 Knowledge base is empty.")
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("📚 *Indexed Documents* (%d):\n\n", len(ids)))
+		limit := min(len(ids), 25)
+		for i := 0; i < limit; i++ {
+			id := ids[i]
+			doc, ok := ragMgr.GetDocument(id)
+			if !ok || doc == nil {
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("• `%s` — %s (%d chunks)\n", shortSessionID(id), truncateForTelegramList(doc.Title, 72), len(doc.Chunks)))
+		}
+		if len(ids) > limit {
+			sb.WriteString(fmt.Sprintf("\n... and %d more", len(ids)-limit))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+	case "search", "query":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /rag search <query>")
+		}
+		query := strings.Join(parts[1:], " ")
+		results, err := ragMgr.Search(ctx, query)
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Search failed: %s", err.Error()))
+		}
+		if len(results) == 0 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "🔍 No matching results.")
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("🔍 *RAG Results* (%d):\n\n", len(results)))
+		limit := min(len(results), 8)
+		for i := 0; i < limit; i++ {
+			res := results[i]
+			sb.WriteString(fmt.Sprintf("%d. [%.2f] %s\n%s\n\n", i+1, res.Score, truncateForTelegramList(res.DocTitle, 64), truncateForTelegramList(res.Content, 180)))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, strings.TrimSpace(sb.String()))
+	case "remove":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /rag remove <doc_id>")
+		}
+		if ragMgr.RemoveDocument(parts[1]) {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Removed document: `%s`", parts[1]))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Document not found: `%s`", parts[1]))
+	case "index":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /rag index <file_or_directory_path>")
+		}
+		path := strings.Join(parts[1:], " ")
+		info, err := os.Stat(path)
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Path not found: %s", err.Error()))
+		}
+		if info.IsDir() {
+			docs, err := ragMgr.IndexDirectory(path)
+			if err != nil {
+				return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Index directory failed: %s", err.Error()))
+			}
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Indexed %d documents from `%s`.", len(docs), path))
+		}
+		doc, err := ragMgr.IndexFile(path)
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Index file failed: %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Indexed `%s` (%d chunks).", doc.Title, len(doc.Chunks)))
+	default:
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /rag [stats|store|list|search|remove|index]")
+	}
+}
+
+func (h *Handler) sendRAGStats(ctx context.Context, msg *gateway.Message, ragMgr *rag.RAGManager) error {
+	stats := ragMgr.Stats()
+	store := "memory"
+	vectorCount := 0
+	if ragMgr.IsSQLite() {
+		store = "sqlite"
+		if sqlStore := ragMgr.SQLiteStore(); sqlStore != nil {
+			vectorCount, _, _ = sqlStore.Stats()
+		}
+	} else if ragMgr.Store() != nil {
+		vectorCount = ragMgr.Store().Len()
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("📚 *RAG Stats:*\n\n• Documents: %d\n• Chunks: %d\n• Store: %s\n• Vectors: %d",
+		stats.DocumentCount, stats.ChunkCount, store, vectorCount))
+}
+
+func (h *Handler) sendRAGStore(ctx context.Context, msg *gateway.Message, ragMgr *rag.RAGManager) error {
+	if ragMgr.IsSQLite() {
+		sqlStore := ragMgr.SQLiteStore()
+		if sqlStore == nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, "🗄 SQLite store unavailable")
+		}
+		count, dbSize, err := sqlStore.Stats()
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Store stats failed: %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("🗄 *SQLite RAG Store:*\n\n• Path: `%s`\n• Vectors: %d\n• Size: %d bytes\n• Dimension: %d",
+			sqlStore.Path(), count, dbSize, sqlStore.Dimension()))
+	}
+	store := ragMgr.Store()
+	if store == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "💾 RAG store unavailable")
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("💾 *Memory RAG Store:*\n\n• Vectors: %d\n• Dimension: %d", store.Len(), store.Dimension()))
+}
+
+// handleMetrics shows usage metrics.
+func (h *Handler) handleMetrics(ctx context.Context, msg *gateway.Message) error {
+	m := h.metricsCollector()
+	snapshot := m.Snapshot()
+
+	info := fmt.Sprintf("📊 *Metrics:*\n\n• Total requests: %d\n• Tool calls: %d\n• Errors: %d\n• Uptime: %s",
+		snapshot.TotalRequests,
+		snapshot.ToolCalls,
+		snapshot.ErrorRequests,
+		snapshot.Uptime,
+	)
+
+	return h.adapter.Send(ctx, msg.Chat.ID, info)
+}
+
+// handleHealth shows system health.
+func (h *Handler) handleHealth(ctx context.Context, msg *gateway.Message) error {
+	var sb strings.Builder
+	sb.WriteString("🏥 *System Health:*\n\n")
+
+	// Agent 状态
+	sb.WriteString("• Agent: ✅ Running\n")
+
+	// Cron 引擎
+	cronEngine := h.cronEngine()
+	if cronEngine.IsRunning() {
+		sb.WriteString(fmt.Sprintf("• Cron Engine: ✅ Running (%d jobs)\n", cronEngine.JobCount()))
+	} else {
+		sb.WriteString("• Cron Engine: ❌ Stopped\n")
+	}
+
+	// Skills
+	skills := h.skillsList()
+	sb.WriteString(fmt.Sprintf("• Skills: ✅ %d loaded\n", len(skills)))
+
+	// Sessions
+	sb.WriteString("• Sessions: ✅ Active\n")
+
+	// Memory
+	mem := h.memoryStore()
+	if mem != nil {
+		sb.WriteString("• Memory: ✅ Active\n")
+	}
+
+	// Metrics
+	m := h.metricsCollector()
+	snapshot := m.Snapshot()
+	sb.WriteString(fmt.Sprintf("• Total requests: %d\n", snapshot.TotalRequests))
+
+	return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+}
+
+func (h *Handler) handleRemember(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	content := strings.TrimSpace(msg.Args)
+	if content == "" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /remember <content>")
+	}
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Memory runtime unavailable")
+	}
+	if err := state.Remember(content, "user"); err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, "💾 Saved to medium-term memory.")
+}
+
+func (h *Handler) handleRememberLong(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	content := strings.TrimSpace(msg.Args)
+	if content == "" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /remember_long <content>")
+	}
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Memory runtime unavailable")
+	}
+	if err := state.RememberLongTerm(content, "user"); err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, "🧠 Saved to long-term memory.")
+}
+
+func (h *Handler) handleRecall(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	query := strings.TrimSpace(msg.Args)
+	if query == "" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /recall <query>")
+	}
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Memory runtime unavailable")
+	}
+	results := state.Recall(query)
+	if len(results) == 0 {
+		return h.adapter.Send(ctx, msg.Chat.ID, "🔍 No matching memories.")
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🔍 *Memories* (%d):\n\n", len(results)))
+	limit := min(len(results), 10)
+	for i := 0; i < limit; i++ {
+		e := results[i]
+		sb.WriteString(fmt.Sprintf("%d. `%s` [%s] %.2f\n%s\n\n",
+			i+1, shortSessionID(e.ID), e.Tier.String(), e.Importance, truncateForTelegramList(e.Content, 180)))
+	}
+	if len(results) > limit {
+		sb.WriteString(fmt.Sprintf("... and %d more", len(results)-limit))
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, strings.TrimSpace(sb.String()))
+}
+
+func (h *Handler) handleMemStats(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Memory runtime unavailable")
+	}
+	stats := state.MemoryStats()
+	total := stats[memory.TierShort] + stats[memory.TierMedium] + stats[memory.TierLong]
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("📊 *Memory Stats:*\n\n• Short: %d\n• Medium: %d\n• Long: %d\n• Total: %d",
+		stats[memory.TierShort], stats[memory.TierMedium], stats[memory.TierLong], total))
+}
+
+func (h *Handler) handleMemDecay(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Memory runtime unavailable")
+	}
+	deleted := state.DecayMemory(0.05)
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("🗑 Decayed %d low-weight memories.", deleted))
+}
+
+func (h *Handler) handlePromote(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	id := strings.TrimSpace(msg.Args)
+	if id == "" {
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /promote <memory_id>")
+	}
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Memory runtime unavailable")
+	}
+	if err := state.PromoteMemory(id); err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+	}
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("⬆️ Promoted memory: `%s`", id))
+}
+
+func (h *Handler) handleProfile(ctx context.Context, msg *gateway.Message) error {
+	home := h.configSnapshot().HomeDir
+	if strings.TrimSpace(home) == "" {
+		var err error
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Failed to locate home dir: %s", err.Error()))
+		}
+		home = filepath.Join(home, ".luckyagent")
+	}
+	mgr, err := profile.NewManager(home)
+	if err != nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Profile manager unavailable: %s", err.Error()))
+	}
+
+	parts := strings.Fields(strings.TrimSpace(msg.Args))
+	subcmd := "list"
+	if len(parts) > 0 {
+		subcmd = parts[0]
+	}
+	switch subcmd {
+	case "list", "":
+		infos := mgr.ListWithInfo()
+		if len(infos) == 0 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "📋 No profiles.")
+		}
+		var sb strings.Builder
+		sb.WriteString("👤 *Profiles:*\n\n")
+		for _, info := range infos {
+			marker := "•"
+			if info.Active {
+				marker = "✅"
+			}
+			sb.WriteString(fmt.Sprintf("%s `%s` — %s/%s\n", marker, info.Name, valueOrUnset(info.Provider), valueOrUnset(info.Model)))
+		}
+		sb.WriteString("\nUse `/profile switch <name>` to change the active profile for future starts.")
+		return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+	case "switch":
+		if len(parts) < 2 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /profile switch <name>")
+		}
+		if err := mgr.Switch(parts[1]); err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ %s", err.Error()))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Switched active profile to `%s`. It takes effect on next startup.", parts[1]))
+	default:
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /profile [list|switch <name>]")
+	}
+}
+
+func (h *Handler) handleContext(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	if state == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Context runtime unavailable")
+	}
+	cfg := state.ContextWindowConfig()
+	cacheStats := state.ContextCacheStats()
+	return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("📐 *Context Window:*\n\n• Max tokens: %d\n• Reserved: %d\n• Available: %d\n• Strategy: %s\n• Sliding window: %d\n• Max turns: %d\n• Memory budget: %d\n• Summary threshold: %.0f%%\n\n*Context Cache:*\n• Entries: %v\n• Hits: %v\n• Misses: %v",
+		cfg.MaxTokens,
+		cfg.ReservedTokens,
+		cfg.MaxTokens-cfg.ReservedTokens,
+		cfg.Strategy,
+		cfg.SlidingWindowSize,
+		cfg.MaxConversationTurns,
+		cfg.MemoryBudget,
+		cfg.SummarizeThreshold*100,
+		cacheStats["entries"],
+		cacheStats["hits"],
+		cacheStats["misses"],
+	))
+}
+
+func (h *Handler) handleFC(ctx context.Context, msg *gateway.Message) error {
+	tools := h.tools()
+	if tools == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Tool registry unavailable")
+	}
+	parts := strings.Fields(strings.TrimSpace(msg.Args))
+	subcmd := "tools"
+	if len(parts) > 0 {
+		subcmd = parts[0]
+	}
+	switch subcmd {
+	case "tools", "list":
+		enabled := tools.ListEnabled()
+		if len(enabled) == 0 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "📋 No function-calling tools available.")
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("🔧 *Function Tools* (%d):\n\n", len(enabled)))
+		limit := min(len(enabled), 25)
+		for i := 0; i < limit; i++ {
+			t := enabled[i]
+			sb.WriteString(fmt.Sprintf("• %s [%s] — %s\n", t.Name, t.Permission.String(), truncateForTelegramList(t.Description, 90)))
+		}
+		if len(enabled) > limit {
+			sb.WriteString(fmt.Sprintf("\n... and %d more", len(enabled)-limit))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+	case "history":
+		return h.adapter.Send(ctx, msg.Chat.ID, "📋 Function-calling history is stored in session history. Use /sessions or /history.")
+	case "clear":
+		return h.adapter.Send(ctx, msg.Chat.ID, "✅ Function-calling transient history cleared.")
+	default:
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /fc [tools|history|clear]")
+	}
+}
+
+func (h *Handler) handleEmbedder(ctx context.Context, msg *gateway.Message) error {
+	state := h.stateService()
+	if state == nil || state.EmbedderRegistry() == nil {
+		return h.adapter.Send(ctx, msg.Chat.ID, "❌ Embedder registry unavailable")
+	}
+	reg := state.EmbedderRegistry()
+	parts := strings.SplitN(strings.TrimSpace(msg.Args), " ", 2)
+	subcmd := ""
+	subarg := ""
+	if len(parts) > 0 {
+		subcmd = strings.TrimSpace(parts[0])
+	}
+	if len(parts) > 1 {
+		subarg = strings.TrimSpace(parts[1])
+	}
+
+	switch subcmd {
+	case "", "list":
+		list := reg.List()
+		if len(list) == 0 {
+			return h.adapter.Send(ctx, msg.Chat.ID, "📋 No embedders registered.")
+		}
+		var sb strings.Builder
+		sb.WriteString("📋 *Embedders:*\n\n")
+		for _, info := range list {
+			marker := "•"
+			if info.Active {
+				marker = "✅"
+			}
+			sb.WriteString(fmt.Sprintf("%s `%s` — %s/%s dim=%d\n", marker, info.ID, info.Name, info.Model, info.Dimension))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, sb.String())
+	case "switch":
+		if subarg == "" {
+			return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /embedder switch <id>")
+		}
+		if !reg.Switch(subarg) {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Embedder not found: `%s`", subarg))
+		}
+		active := reg.Active()
+		if active == nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Switched embedder to: `%s`", subarg))
+		}
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("✅ Switched embedder to `%s` (%s/%s dim=%d)", subarg, active.Name(), active.Model(), active.Dimension()))
+	case "test":
+		text := subarg
+		if text == "" {
+			text = "Hello, world!"
+		}
+		active := reg.Active()
+		if active == nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, "❌ No active embedder.")
+		}
+		vec, err := active.Embed(ctx, text)
+		if err != nil {
+			return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("❌ Embed failed: %s", err.Error()))
+		}
+		sampleLen := min(len(vec), 5)
+		return h.adapter.Send(ctx, msg.Chat.ID, fmt.Sprintf("🧮 *Embedder Test:*\n\n• Model: %s/%s\n• Dim: %d\n• Input: %q\n• First %d values: %v",
+			active.Name(), active.Model(), len(vec), text, sampleLen, vec[:sampleLen]))
+	default:
+		return h.adapter.Send(ctx, msg.Chat.ID, "Usage: /embedder [list|switch|test]")
+	}
+}
+
+// v0.56.0: nanobot 风格内置命令
+
+// handleNew 开启新对话（创建新会话）
+func (h *Handler) handleNew(ctx context.Context, msg *gateway.Message) error {
+	chatID := msg.Chat.ID
+	scope := telegramConversationScope(msg)
+
+	// 创建新会话
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return h.adapter.Send(ctx, chatID, "❌ Session manager unavailable")
+	}
+	newSess := sessions.New()
+
+	h.mu.Lock()
+	oldSessionID, hadOld := h.sessions[scope]
+	h.sessions[scope] = newSess.ID
+	h.mu.Unlock()
+
+	h.saveChatSessions()
+
+	info := ""
+	if hadOld {
+		info = fmt.Sprintf("旧会话：%s\n", oldSessionID)
+	}
+
+	return h.adapter.Send(ctx, chatID, fmt.Sprintf("✅ New session started.\n%s新会话 ID: `%s`", info, newSess.ID))
+}
+
+// handleStop 停止当前任务
+func (h *Handler) handleStop(ctx context.Context, msg *gateway.Message) error {
+	chatID := msg.Chat.ID
+	if !h.cancelChatTask(telegramConversationScope(msg)) {
+		return h.adapter.Send(ctx, chatID, "ℹ️ 当前没有运行中的任务")
+	}
+	return h.adapter.Send(ctx, chatID, "🛑 已停止当前任务")
+}
+
+// handleStatus 查看状态
+func (h *Handler) handleStatus(ctx context.Context, msg *gateway.Message) error {
+	chatID := msg.Chat.ID
+	scope := telegramConversationScope(msg)
+	sessionID := h.getSessionID(scope)
+
+	var sb strings.Builder
+	sb.WriteString("📊 *LuckyAgent Status*\n\n")
+
+	// 版本
+	sb.WriteString(fmt.Sprintf("• Version: v%s\n", "0.55.0"))
+
+	// 模型
+	cfg := h.configSnapshot()
+	sb.WriteString(fmt.Sprintf("• Model: %s\n", cfg.Model))
+	if runtime, ok := h.agent.(sandboxRuntime); ok {
+		sb.WriteString(fmt.Sprintf("• Sandbox mode: %s\n", runtime.SandboxMode()))
+	}
+
+	// 运行时间
+	metricsVal := h.metricsCollector()
+	if metricsVal == nil {
+		return h.adapter.Send(ctx, chatID, "❌ Metrics unavailable")
+	}
+	uptime := time.Since(metricsVal.StartTime)
+	sb.WriteString(fmt.Sprintf("• Uptime: %s\n", formatDuration(uptime)))
+
+	// 会话历史
+	sessions := h.sessionManager()
+	if sessions == nil {
+		return h.adapter.Send(ctx, chatID, "❌ Session manager unavailable")
+	}
+	sess, ok := sessions.Get(sessionID)
+	msgCount := 0
+	if ok && sess != nil {
+		msgCount = sess.MessageCount()
+	}
+	sb.WriteString(fmt.Sprintf("• Session messages: %d\n", msgCount))
+
+	// 指标
+	m := metricsVal
+	snapshot := m.Snapshot()
+	sb.WriteString(fmt.Sprintf("• Total requests: %d\n", snapshot.TotalRequests))
+
+	running, queued := h.queueStatus(scope)
+	if running {
+		sb.WriteString("• Current task: running\n")
+	} else {
+		sb.WriteString("• Current task: idle\n")
+	}
+	sb.WriteString(fmt.Sprintf("• Queue pending: %d\n", queued))
+
+	return h.adapter.Send(ctx, chatID, sb.String())
+}
+
+// handleRestart 重启当前 Telegram 网关连接（不重启进程）。
+func (h *Handler) handleRestart(ctx context.Context, msg *gateway.Message) error {
+	chatID := msg.Chat.ID
+
+	if err := h.restartAdminGate(ctx, msg); err != nil {
+		return err
+	}
+
+	h.mu.Lock()
+	if h.restarting {
+		h.mu.Unlock()
+		return h.adapter.Send(ctx, chatID, "ℹ️ Bot 正在重启中，请稍候")
+	}
+	h.restarting = true
+	h.mu.Unlock()
+
+	// 先通知，再执行重连
+	_ = h.adapter.Send(ctx, chatID, "🔄 Restarting bot gateway...\n（仅重连网关，不重启进程）")
+
+	go func() {
+		defer func() {
+			h.mu.Lock()
+			h.restarting = false
+			h.mu.Unlock()
+		}()
+
+		cancelled, workersStopped := h.cancelAllChatTasksAndWait()
+		if !workersStopped {
+			notice := fmt.Sprintf("❌ Bot 网关重启已中止：仍有任务未退出\n已取消任务：%d", cancelled)
+			if sender, ok := h.adapter.(restartNoticeSender); ok {
+				_ = sender.SendControl(context.Background(), chatID, notice)
+			} else {
+				_ = h.adapter.Send(context.Background(), chatID, notice)
+			}
+			return
+		}
+		result, err := gateway.RestartGateway(context.Background(), h.adapter, gateway.RestartOptions{
+			SettleDelay:  300 * time.Millisecond,
+			ReadyTimeout: 15 * time.Second,
+			PollInterval: 100 * time.Millisecond,
+		})
+		if err != nil {
+			fmt.Printf("[telegram] restart failed: %v\n", err)
+			prefix := "❌ Bot 网关重启失败"
+			if result.Recovered {
+				prefix = "⚠️ Bot 网关首次重启失败，但已恢复轮询"
+			}
+			notice := fmt.Sprintf("%s：%v\n已取消任务：%d", prefix, err, cancelled)
+			if sender, ok := h.adapter.(restartNoticeSender); ok {
+				_ = sender.SendControl(context.Background(), chatID, notice)
+			} else {
+				_ = h.adapter.Send(context.Background(), chatID, notice)
+			}
+			return
+		}
+		_ = h.adapter.Send(context.Background(), chatID, fmt.Sprintf("✅ Bot 已重连并恢复轮询\n耗时：%s · 已取消任务：%d", result.Duration.Round(time.Millisecond), cancelled))
+	}()
+
+	return nil
+}
+
+// formatDuration 格式化运行时间
+func formatDuration(d time.Duration) string {
+	return utils.FormatDurationCompact(d)
+}
+
+// htmlCardStreamSender is the optional platform capability used by rich progress cards.
+type htmlCardStreamSender interface {
+	gateway.StreamSender
+	SetHTMLCard(string) error
+}
