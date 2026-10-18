@@ -415,6 +415,7 @@ func (s *Server) Start() error {
 		Root:                 s.handleRoot,
 	})
 	mux.HandleFunc("/api/v1/mcp/servers", s.handleMCPServers)
+	s.registerPluginManagementRoutes(mux)
 
 	var handler http.Handler = mux
 
