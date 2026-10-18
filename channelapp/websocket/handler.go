@@ -57,6 +57,11 @@ type sessionRunner struct {
 	cancelled bool
 }
 
+type clientReplayLock struct {
+	mu    sync.Mutex
+	users int
+}
+
 // AgentHandler 将 WebSocket 消息桥接到 Agent Loop
 type AgentHandler struct {
 	agent     agentRuntime
@@ -67,6 +72,7 @@ type AgentHandler struct {
 	eventSink func(string, *Message)
 	lucky     *luckycollector.Lucky
 	started   bool
+	replays   map[*Client]*clientReplayLock
 	mu        sync.Mutex
 }
 
@@ -110,6 +116,7 @@ func (h *AgentHandler) Start() {
 			Message:     persisted.Message,
 			Stream:      persisted.Stream,
 			MaxIter:     persisted.MaxIter,
+			ProfileID:   persisted.ProfileID,
 			Attachments: persisted.Attachments,
 		}
 		run := &queuedRun{id: persisted.ID, parentID: persisted.ParentID, data: data}
@@ -190,12 +197,45 @@ func firstNonEmptyWS(values ...string) string {
 // HandleReconnect replays events after the supplied cursor. Without a usable
 // cursor it only replays events belonging to runs that are still active.
 func (h *AgentHandler) HandleReconnect(client *Client, msg *Message) {
+	unlock := h.lockClientReplay(client)
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := client.BeginReplay(); err != nil {
+		client.Close()
+		return
+	}
+	delivered := make(map[string]bool)
+	defer func() {
+		if err := client.EndReplay(ctx, delivered); err != nil {
+			client.Close()
+		}
+	}()
+	send := func(event *Message) bool {
+		if err := client.SendReliable(ctx, event); err != nil {
+			client.Close()
+			return false
+		}
+		if event.EventID != "" {
+			delivered[event.EventID] = true
+		} else if event.ID != "" {
+			delivered[event.ID] = true
+		}
+		return true
+	}
 	var data ReconnectData
 	if len(msg.Data) > 0 && msg.ParseData(&data) != nil {
 		data.LastMessageID = ""
 	}
-	for _, event := range h.store.ReplayForReconnect(client.SessionID, strings.TrimSpace(data.LastMessageID)) {
-		client.TrySend(event)
+	events, err := h.store.ReplayForReconnectWithError(client.SessionID, strings.TrimSpace(data.LastMessageID))
+	if err != nil {
+		h.sendChatError(client, msg.ID, "RECOVERY_FAILED", "could not load durable session events")
+		return
+	}
+	for _, event := range events {
+		if !send(event) {
+			return
+		}
 	}
 	for _, run := range h.store.ActiveRuns(client.SessionID) {
 		state := "queued"
@@ -209,7 +249,9 @@ func (h *AgentHandler) HandleReconnect(client *Client, msg *Message) {
 		status.RunID = run.ID
 		status.ID = ""
 		status.EventID = ""
-		client.TrySend(status)
+		if !send(status) {
+			return
+		}
 	}
 	status, _ := NewMessage(TypeStatus, client.SessionID, StatusData{
 		State:   "connected",
@@ -217,7 +259,9 @@ func (h *AgentHandler) HandleReconnect(client *Client, msg *Message) {
 	})
 	status.ID = ""
 	status.EventID = ""
-	client.TrySend(status)
+	if !send(status) {
+		return
+	}
 	logger.Info("client reconnecting", "client_id", client.ID, "last_msg", data.LastMessageID)
 }
 
@@ -394,6 +438,24 @@ func (h *AgentHandler) handleChat(client *Client, msg *Message) {
 		client.TrySend(errMsg)
 		return
 	}
+	if data.MaxIter < 0 || data.MaxIter > 300 || (strings.TrimSpace(data.Message) == "" && len(data.Attachments) == 0) {
+		h.sendChatError(client, msg.ID, "INVALID_DATA", "message or attachments are required and max_iterations must be between 0 and 300")
+		return
+	}
+	if data.ProfileID != "" {
+		h.sendChatError(client, msg.ID, "UNSUPPORTED_PARAMETER", "profile_id is not supported for a per-request model selection; use the model profile API")
+		return
+	}
+	if data.MaxIter > 0 {
+		if _, ok := h.agent.(loopConfigRuntime); !ok {
+			h.sendChatError(client, msg.ID, "UNSUPPORTED_PARAMETER", "this runtime cannot apply max_iterations")
+			return
+		}
+	}
+	if h.agent == nil {
+		h.sendChatError(client, msg.ID, "UNAVAILABLE", "agent runtime unavailable")
+		return
+	}
 
 	run := &queuedRun{
 		id:       msg.ID,
@@ -415,13 +477,25 @@ func (h *AgentHandler) handleChat(client *Client, msg *Message) {
 		Message:     data.Message,
 		Stream:      data.Stream,
 		MaxIter:     data.MaxIter,
+		ProfileID:   data.ProfileID,
 		Attachments: data.Attachments,
 		State:       "queued",
 		CreatedAt:   time.Now().UTC(),
 		UpdatedAt:   time.Now().UTC(),
 	}
-	if err := h.store.UpsertRun(persisted); err != nil {
+	stored, created, err := h.store.CreateRun(persisted)
+	if err != nil {
 		logger.Error("persist websocket run failed", "session", client.SessionID, "error", err)
+		code := "PERSIST_FAILED"
+		if errors.Is(err, errRunConflict) {
+			code = "REQUEST_CONFLICT"
+		}
+		h.sendChatError(client, run.parentID, code, err.Error())
+		return
+	}
+	if !created {
+		h.replayAcceptedRun(client, stored)
+		return
 	}
 	h.mu.Lock()
 	runner := h.runners[client.SessionID]
@@ -571,7 +645,7 @@ func (h *AgentHandler) syncChatRun(ctx context.Context, client *Client, data Cha
 
 	sessionID := h.ensureSession(client.SessionID)
 	turn := agent.MultimodalUserTurnInput(data.Message, data.Attachments)
-	result, err := h.agent.ChatWithSessionInput(ctx, sessionID, turn)
+	result, iterations, err := h.syncTurn(ctx, sessionID, turn, data)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -600,7 +674,7 @@ func (h *AgentHandler) syncChatRun(ctx context.Context, client *Client, data Cha
 	response, responseAttachments := h.attachmentsFromResponse(result)
 	endMsg, _ := NewMessage(TypeStreamEnd, client.SessionID, StreamEndData{
 		FullResponse: response,
-		Iterations:   1,
+		Iterations:   iterations,
 		CreatedAt:    createdAt,
 		Usage:        provider.ToTurnTokenUsage(usage),
 		Attachments:  appendUniqueAttachments(h.attachmentsFromToolResult("", result), responseAttachments...),
@@ -633,7 +707,13 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 
 	sessionID := h.ensureSession(client.SessionID)
 	turn := agent.MultimodalUserTurnInput(data.Message, data.Attachments)
-	streamCh, err := h.agent.ChatWithSessionStreamInput(ctx, sessionID, turn)
+	var streamCh <-chan agent.ChatEvent
+	var err error
+	if runtime, ok := h.agent.(loopConfigRuntime); ok {
+		streamCh, err = runtime.ChatWithSessionStreamInputWithLoopConfig(ctx, sessionID, turn, h.chatLoopConfig(data))
+	} else {
+		streamCh, err = h.agent.ChatWithSessionStreamInput(ctx, sessionID, turn)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -896,27 +976,21 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			sendError(evt.Err)
-			return evt.Err
+			streamErr := evt.Err
+			if streamErr == nil {
+				streamErr = errors.New("agent stream failed")
+			}
+			sendError(streamErr)
+			return streamErr
 		}
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
-	if fullResponse.Len() > 0 {
-		response, responseAttachments := h.attachmentsFromResponse(fullResponse.String())
-		turnAttachments = appendUniqueAttachments(turnAttachments, responseAttachments...)
-		endMsg, _ := NewMessage(TypeStreamEnd, client.SessionID, StreamEndData{
-			FullResponse: response,
-			Iterations:   max(currentRound, 1),
-			Attachments:  turnAttachments,
-		})
-		endMsg.ParentID = parentID
-		h.emit(client, client.SessionID, runID, endMsg)
-	}
-	sendIdle()
-	return nil
+	err = errors.New("agent stream ended without a completed result")
+	sendError(err)
+	return err
 }
 
 type toolAttachmentPayload struct {

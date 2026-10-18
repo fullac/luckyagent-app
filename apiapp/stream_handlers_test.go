@@ -3,26 +3,15 @@ package server
 import (
 	"bytes"
 	"encoding/json"
-	appboot "github.com/yurika0211/luckyagent-app/bootstrap"
-	"github.com/yurika0211/luckyagent-runtime/config"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
 func TestHandleRAGStreamStatus(t *testing.T) {
-	mgr, err := config.NewManager()
-	if err != nil {
-		t.Fatalf("create config manager: %v", err)
-	}
-	mgr.Load()
-
-	a, err := appboot.New(mgr)
-	if err != nil {
-		t.Fatalf("create agent: %v", err)
-	}
-
+	a := createTestAgent(t)
 	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/rag/stream/status", nil)
 	w := httptest.NewRecorder()
@@ -44,21 +33,13 @@ func TestHandleRAGStreamStatus(t *testing.T) {
 }
 
 func TestHandleRAGStreamWatch(t *testing.T) {
-	mgr, err := config.NewManager()
-	if err != nil {
-		t.Fatalf("create config manager: %v", err)
-	}
-	mgr.Load()
-
-	a, err := appboot.New(mgr)
-	if err != nil {
-		t.Fatalf("create agent: %v", err)
-	}
-
+	a := createTestAgent(t)
 	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
+	watchJSON, _ := json.Marshal(map[string]string{"dir": t.TempDir()})
 
 	// Test POST - add watch
-	body := bytes.NewBufferString(`{"dir":"/tmp"}`)
+	body := bytes.NewBuffer(watchJSON)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/stream/watch", body)
 	w := httptest.NewRecorder()
 
@@ -78,7 +59,7 @@ func TestHandleRAGStreamWatch(t *testing.T) {
 	}
 
 	// Test DELETE - remove watch
-	body = bytes.NewBufferString(`{"dir":"/tmp"}`)
+	body = bytes.NewBuffer(watchJSON)
 	req = httptest.NewRequest(http.MethodDelete, "/api/v1/rag/stream/watch", body)
 	w = httptest.NewRecorder()
 
@@ -100,18 +81,9 @@ func TestHandleRAGStreamWatch(t *testing.T) {
 }
 
 func TestHandleRAGStreamScan(t *testing.T) {
-	mgr, err := config.NewManager()
-	if err != nil {
-		t.Fatalf("create config manager: %v", err)
-	}
-	mgr.Load()
-
-	a, err := appboot.New(mgr)
-	if err != nil {
-		t.Fatalf("create agent: %v", err)
-	}
-
+	a := createTestAgent(t)
 	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
 
 	// Test POST
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/stream/scan", nil)
@@ -144,18 +116,9 @@ func TestHandleRAGStreamScan(t *testing.T) {
 }
 
 func TestHandleRAGStreamStartStop(t *testing.T) {
-	mgr, err := config.NewManager()
-	if err != nil {
-		t.Fatalf("create config manager: %v", err)
-	}
-	mgr.Load()
-
-	a, err := appboot.New(mgr)
-	if err != nil {
-		t.Fatalf("create agent: %v", err)
-	}
-
+	a := createTestAgent(t)
 	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
 
 	// Test start
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/stream/start", nil)
@@ -198,18 +161,9 @@ func TestHandleRAGStreamStartStop(t *testing.T) {
 }
 
 func TestHandleRAGStreamQueue(t *testing.T) {
-	mgr, err := config.NewManager()
-	if err != nil {
-		t.Fatalf("create config manager: %v", err)
-	}
-	mgr.Load()
-
-	a, err := appboot.New(mgr)
-	if err != nil {
-		t.Fatalf("create agent: %v", err)
-	}
-
+	a := createTestAgent(t)
 	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/rag/stream/queue", nil)
 	w := httptest.NewRecorder()
@@ -234,18 +188,9 @@ func TestHandleRAGStreamQueue(t *testing.T) {
 }
 
 func TestHandleRAGStreamProcess(t *testing.T) {
-	mgr, err := config.NewManager()
-	if err != nil {
-		t.Fatalf("create config manager: %v", err)
-	}
-	mgr.Load()
-
-	a, err := appboot.New(mgr)
-	if err != nil {
-		t.Fatalf("create agent: %v", err)
-	}
-
+	a := createTestAgent(t)
 	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
 
 	// Test POST with empty queue
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/rag/stream/process", nil)

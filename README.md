@@ -23,8 +23,12 @@ so it can still build `lh` without a module dependency cycle.
 
 Generic HTTP/SSE/WebSocket/gRPC transport remains in `luckyagent-api`. Platform
 connections and protocols remain in `luckyagent-gateway`. Those transport
-modules do not import the Agent. HTTP routes, wire fields, session files and
-configuration keys keep their existing behavior.
+modules do not import the Agent. HTTP routes, public wire field names and
+configuration keys retain their ownership and compatibility contracts.
+
+The API reliability contracts, including request retries, stream terminal
+states, local authentication and gRPC integration, are documented in
+[API execution and recovery](docs/api-reliability.md).
 
 ## Embed the complete runtime
 

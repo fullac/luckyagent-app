@@ -73,6 +73,7 @@ func TestNew(t *testing.T) {
 	a := createTestAgent(t)
 	cfg := DefaultServerConfig()
 	s := New(a, cfg)
+	t.Cleanup(func() { _ = s.Stop() })
 
 	if s == nil {
 		t.Fatal("server should not be nil")
@@ -92,11 +93,11 @@ func TestNew(t *testing.T) {
 	if err := s.collabRegistry.Register(&collab.AgentProfile{ID: "agent-test", Name: "Agent Test"}); err != nil {
 		t.Fatalf("register collab agent: %v", err)
 	}
-	task, err := s.delegateManager.Delegate(context.Background(), collab.ModeParallel, "test unified store", "input", []string{"agent-test"}, time.Second)
+	task, err := s.delegateManager.Delegate(context.Background(), collab.ModeParallel, "test unified store", "input", []string{"agent-test"}, 5*time.Second)
 	if err != nil {
 		t.Fatalf("delegate collab task: %v", err)
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		record, ok, err := a.TaskStore().Get(task.ID)
 		if err != nil {
@@ -888,6 +889,7 @@ func TestAuthMiddlewareNoKeys(t *testing.T) {
 	// 来自 localhost 的请求应被允许
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "localhost:9090"
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 

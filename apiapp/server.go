@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 
 	"encoding/json"
 	"errors"
@@ -444,9 +445,7 @@ func (s *Server) Start() error {
 	var handler http.Handler = mux
 
 	// 中间件链
-	handler = s.recoveryMiddleware(handler)
-	handler = s.rateLimitMiddleware(handler)
-	handler = s.authMiddleware(handler)
+	handler = s.transportPolicy().Protect(handler)
 	if s.config.EnableCORS {
 		handler = s.corsMiddleware(handler)
 	}
@@ -658,13 +657,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.metrics.RecordChatRequest()
 
 	var req ChatRequest
-	if err := jsonAPI.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendError(w, "invalid request body", http.StatusBadRequest, err.Error())
+	if err := transport.DecodeJSON(w, r, &req, transport.DefaultJSONBodyLimit); err != nil {
+		transport.SendRequestError(w, err)
 		return
 	}
 
 	if req.Message == "" && len(req.Attachments) == 0 {
 		s.sendError(w, "message is required", http.StatusBadRequest, "")
+		return
+	}
+	if !s.validateChatSession(w, req.SessionID) {
+		return
+	}
+	if req.MaxIter < 0 || req.MaxIter > 300 {
+		s.sendError(w, "max_iterations must be between 0 and 300", http.StatusBadRequest, "")
 		return
 	}
 
@@ -685,7 +691,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	parentCtx := r.Context()
 
 	// SSE 流式响应
-	flusher, ok := w.(http.Flusher)
+	_, ok := w.(http.Flusher)
 	if !ok {
 		// 不支持 SSE，降级为同步
 		s.doChatSync(w, r, req, loopCfg, parentCtx, start)
@@ -709,10 +715,30 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := s.registerChatCancellation(parentCtx, sessionID)
 	defer cancel()
+	runID := "http-" + rand.Text()
+	sequence := 0
+	writeFrame := func(frame map[string]any) error {
+		sequence++
+		eventID := fmt.Sprintf("%s:%d", runID, sequence)
+		frame["run_id"], frame["event_id"], frame["session_id"] = runID, eventID, sessionID
+		data, err := jsonAPI.Marshal(frame)
+		if err != nil {
+			return err
+		}
+		_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if _, err := fmt.Fprintf(w, "id: %s\ndata: %s\n\n", eventID, data); err != nil {
+			return err
+		}
+		if err := controller.Flush(); err != nil {
+			return err
+		}
+		_ = controller.SetWriteDeadline(time.Time{})
+		return nil
+	}
 	turn := agent.MultimodalUserTurnInput(req.Message, req.Attachments)
 	events, err := s.agent.ChatWithSessionStreamInputWithLoopConfig(ctx, sessionID, turn, loopCfg)
 	if err != nil {
-		s.sendSSEError(w, flusher, err.Error())
+		_ = writeFrame(map[string]any{"type": "error", "error": err.Error(), "error_code": "CHAT_FAILED", "status": "failed"})
 		return
 	}
 
@@ -720,9 +746,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// event is arriving. A failed write cancels the turn and drains its channel.
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
-	writeFrame := func(frame string) error {
+	writeHeartbeat := func() error {
 		_ = controller.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if _, err := fmt.Fprint(w, frame); err != nil {
+		if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
 			return err
 		}
 		if err := controller.Flush(); err != nil {
@@ -733,27 +759,49 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() {
 		cancel()
+		drained := make(chan struct{})
 		go func() {
+			defer close(drained)
 			for range events {
 			}
 		}()
+		// Let the cancelled runtime finish saving its transcript before the
+		// handler is considered closed. A non-cooperative provider must not
+		// hold the HTTP connection indefinitely.
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-drained:
+		case <-timer.C:
+			logger.Warn("chat stream cleanup exceeded deadline", "session_id", sessionID, "run_id", runID)
+		}
 	}()
+	completed := false
 chatEvents:
 	for {
 		var event agent.ChatEvent
 		select {
 		case <-ctx.Done():
+			_ = writeFrame(map[string]any{"type": "cancelled", "status": "cancelled", "error": ctx.Err().Error()})
 			return
 		case <-heartbeat.C:
-			if err := writeFrame(": keepalive\n\n"); err != nil {
+			if err := writeHeartbeat(); err != nil {
 				return
 			}
 			continue
 		case next, ok := <-events:
 			if !ok {
+				if ctx.Err() != nil {
+					_ = writeFrame(map[string]any{"type": "cancelled", "status": "cancelled", "error": ctx.Err().Error()})
+					return
+				}
 				break chatEvents
 			}
 			event = next
+		}
+		if ctx.Err() != nil {
+			_ = writeFrame(map[string]any{"type": "cancelled", "status": "cancelled", "error": ctx.Err().Error()})
+			return
 		}
 		frame := map[string]interface{}{
 			"type":        chatEventTypeString(event.Type),
@@ -764,28 +812,48 @@ chatEvents:
 			"result":      event.Result,
 			"observation": event.Observation,
 			"approval":    event.Approval,
-			"error":       event.Err,
+			"error":       nil,
+			"created_at":  event.CreatedAt,
+			"usage":       event.Usage,
+		}
+		if event.Err != nil {
+			frame["error"] = event.Err.Error()
+		}
+		if event.Type == agent.ChatEventError {
+			if ctx.Err() != nil || errors.Is(event.Err, context.Canceled) {
+				_ = writeFrame(map[string]any{"type": "cancelled", "status": "cancelled", "error": "chat cancelled"})
+				return
+			}
+			if event.Err == nil {
+				frame["error"] = "agent stream failed"
+			}
+			frame["error_code"], frame["status"] = "CHAT_FAILED", "failed"
 		}
 		if event.Compact != nil {
 			frame["compact"] = event.Compact
 		}
-		data, _ := jsonAPI.Marshal(frame)
-
-		if err := writeFrame(fmt.Sprintf("data: %s\n\n", data)); err != nil {
+		if err := writeFrame(frame); err != nil {
 			return
 		}
 
-		if event.Type == agent.ChatEventDone || event.Type == agent.ChatEventError {
+		if event.Type == agent.ChatEventError {
+			return
+		}
+		if event.Type == agent.ChatEventDone {
+			completed = true
 			break chatEvents
 		}
 	}
 
-	duration := time.Since(start)
-	summary, _ := jsonAPI.Marshal(map[string]interface{}{
-		"type":     "complete",
-		"duration": duration.String(),
-	})
-	_ = writeFrame(fmt.Sprintf("data: %s\n\n", summary))
+	if !completed {
+		if ctx.Err() != nil {
+			_ = writeFrame(map[string]any{"type": "cancelled", "status": "cancelled", "error": ctx.Err().Error()})
+			return
+		}
+		_ = writeFrame(map[string]any{"type": "error", "error": "agent stream ended without a result", "error_code": "STREAM_INCOMPLETE", "status": "failed"})
+		return
+	}
+	_ = writeFrame(map[string]any{"type": "complete", "duration": time.Since(start).String(), "status": "completed"})
 }
 
 // handleChatSync 同步聊天
@@ -805,13 +873,20 @@ func (s *Server) handleChatSync(w http.ResponseWriter, r *http.Request) {
 	s.metrics.RecordChatRequest()
 
 	var req ChatRequest
-	if err := jsonAPI.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendError(w, "invalid request body", http.StatusBadRequest, err.Error())
+	if err := transport.DecodeJSON(w, r, &req, transport.DefaultJSONBodyLimit); err != nil {
+		transport.SendRequestError(w, err)
 		return
 	}
 
 	if req.Message == "" && len(req.Attachments) == 0 {
 		s.sendError(w, "message is required", http.StatusBadRequest, "")
+		return
+	}
+	if !s.validateChatSession(w, req.SessionID) {
+		return
+	}
+	if req.MaxIter < 0 || req.MaxIter > 300 {
+		s.sendError(w, "max_iterations must be between 0 and 300", http.StatusBadRequest, "")
 		return
 	}
 
@@ -935,20 +1010,19 @@ func (s *Server) doChatSync(w http.ResponseWriter, r *http.Request, req ChatRequ
 			sess = s
 		}
 	}
+	if sess == nil {
+		s.sendError(w, "session not found", http.StatusNotFound, "")
+		return
+	}
 	ctx, cancel := s.registerChatCancellation(ctx, sessionID)
 	defer cancel()
 
-	// 使用 RunLoopWithSession 确保消息被保存；无法创建/获取会话时降级为无会话 RunLoop
+	// Every successful response must belong to the actual persisted session.
 	var (
 		result *agent.LoopResult
 		err    error
 	)
-	if sess != nil {
-		loopCfgWithSession := loopCfg
-		result, err = s.agent.RunLoopWithSessionInput(ctx, sess, turn, loopCfgWithSession)
-	} else {
-		result, err = s.agent.RunLoopWithSessionInput(ctx, nil, turn, loopCfg)
-	}
+	result, err = s.agent.RunLoopWithSessionInput(ctx, sess, turn, loopCfg)
 	if err != nil {
 		s.statsMu.Lock()
 		s.stats.ErrorReqs++

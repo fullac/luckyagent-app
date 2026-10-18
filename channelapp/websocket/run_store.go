@@ -6,3 +6,4 @@ type runStore = transport.RunStore
 type persistedRun = transport.RunRecord
 
 var newRunStore = transport.NewRunStore
+var errRunConflict = transport.ErrRunConflict

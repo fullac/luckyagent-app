@@ -10,6 +10,8 @@ import (
 	"github.com/yurika0211/luckyagent-runtime/rag"
 	"github.com/yurika0211/luckyagent-runtime/workflow"
 	"github.com/yurika0211/luckyagent-tools/memory"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // mockExecutor is a simple test executor
@@ -743,14 +745,16 @@ func TestServer_InstanceToProtoViaStart(t *testing.T) {
 	}
 }
 
-// ── Chat & ChatStream Tests ──────────────────────────────────────
-// Note: Chat and ChatStream require a real *agent.Agent instance which is complex to mock.
-// These tests are skipped until we have a proper integration test setup.
-
 func TestServer_Chat_WithNilAgent(t *testing.T) {
-	t.Skip("Chat requires real *agent.Agent, skipping for unit test")
+	_, err := NewServer(nil, nil, nil, nil).Chat(context.Background(), &ChatRequest{Message: "hello"})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("Chat returned %v, want Unavailable", err)
+	}
 }
 
 func TestServer_ChatStream_WithNilAgent(t *testing.T) {
-	t.Skip("ChatStream requires real *agent.Agent, skipping for unit test")
+	err := NewServer(nil, nil, nil, nil).ChatStream(&ChatRequest{Message: "hello"}, &grpcRecordingStream{ctx: context.Background()})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("ChatStream returned %v, want Unavailable", err)
+	}
 }
