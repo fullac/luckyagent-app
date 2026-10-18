@@ -294,6 +294,10 @@ func (a agentProviderAdapter) Skills() []*tool.SkillInfo {
 	return a.inner.Skills()
 }
 
+func (a agentProviderAdapter) HasPluginCommand(input string) bool {
+	return a.inner.HasPluginCommand(input)
+}
+
 func (a agentProviderAdapter) CronEngine() *cron.Engine {
 	return a.inner.CronEngine()
 }
@@ -1690,7 +1694,11 @@ func (h *Handler) HandleMessage(ctx context.Context, msg *gateway.Message) error
 		h.reactToIncomingMessage(msg)
 		return nil
 	}
-	if msg.IsCommand {
+	pluginCommand := false
+	if runtime, ok := h.agent.(interface{ HasPluginCommand(string) bool }); ok {
+		pluginCommand = runtime.HasPluginCommand(msg.Text)
+	}
+	if msg.IsCommand && !pluginCommand {
 		return h.handleCommand(ctx, msg)
 	}
 

@@ -26,6 +26,11 @@ connections and protocols remain in `luckyagent-gateway`. Those transport
 modules do not import the Agent. HTTP routes, wire fields, session files and
 configuration keys keep their existing behavior.
 
+`lh plugin` manages declarative plugin installations without constructing an
+Agent. Enabled plugins add namespaced commands to CLI, HTTP and gateway turns;
+execution and inherited policy belong to the public Agent module. See
+[plugin application integration](docs/plugins.md).
+
 ## Embed the complete runtime
 
 ```go
