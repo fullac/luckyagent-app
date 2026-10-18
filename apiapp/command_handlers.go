@@ -68,14 +68,24 @@ type commandRequest struct {
 func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
+		commands := webCommandSpecs()
+		if s.agent != nil {
+			for _, name := range s.agent.PluginCommands() {
+				commands = append(commands, commandSpec{Name: name, Usage: "/" + name + " [arguments]", Description: "Run installed plugin command", Group: "plugins"})
+			}
+		}
 		s.sendJSON(w, http.StatusOK, map[string]interface{}{
-			"commands": webCommandSpecs(),
-			"count":    len(webCommandSpecs()),
+			"commands": commands,
+			"count":    len(commands),
 		})
 	case http.MethodPost:
 		var req commandRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
 			s.sendError(w, "invalid request body", http.StatusBadRequest, err.Error())
+			return
+		}
+		if s.agent != nil && s.agent.HasPluginCommand("/"+strings.TrimPrefix(strings.TrimSpace(req.Command), "/")) {
+			s.handlePluginCommand(w, r, req)
 			return
 		}
 		name := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(req.Command), "/"))

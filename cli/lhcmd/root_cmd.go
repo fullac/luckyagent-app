@@ -393,6 +393,7 @@ func newRootCmd() *cobra.Command {
 	proactiveCmd.AddCommand(proactiveStatusCmd, proactiveSampleCmd, proactiveDryRunCmd, proactiveActCmd, proactiveFeedbackCmd, proactiveEventsCmd, proactiveExecutionsCmd, proactiveKernelsCmd)
 
 	rootCmd.AddCommand(initCmd, chatCmd, configCmd, credentialCmd, diagCmd, soulCmd, versionCmd, newUpdateCmd(), serveCmd, qrCmd, msgGatewayCmd, ragCmd, memoryCmd, proactiveCmd, newSessionCmd())
+	rootCmd.AddCommand(newPluginCmd())
 
 	return rootCmd
 }
