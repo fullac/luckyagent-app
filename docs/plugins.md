@@ -37,7 +37,46 @@ Execution trust (`--trust`) is required for MCP, hooks and skill scripts.
 Updates do not inherit trust for changed content. The Agent enforces tool
 approval, sandbox restrictions, parent limits and cancellation. This release
 supports an explicit subset of Codex/Claude manifests; it does not implement
-their full hook protocols, LSP, OAuth or a plugin management UI.
+their full hook protocols, LSP or OAuth.
+
+## HTTP plugin management
+
+The Android client uses the following authenticated routes, registered by
+`apiapp/plugin_management.go` under the same transport policy as other APIs:
+
+| Method | Route | Operation |
+| --- | --- | --- |
+| GET | `/api/v1/plugins` | Verified installed inventory, including disabled and damaged entries |
+| POST | `/api/v1/plugins` | Install `{source, ref?, subdir?, trust?}` |
+| GET | `/api/v1/plugins/{name}` | Inspect one installed plugin |
+| POST | `/api/v1/plugins/{name}/enable` | Save enabled state |
+| POST | `/api/v1/plugins/{name}/disable` | Save disabled state |
+| POST | `/api/v1/plugins/{name}/update` | Reinstall recorded source with `{trust:false}` by default |
+| DELETE | `/api/v1/plugins/{name}` | Remove installation registration; retain immutable cache |
+
+Inventory is `{plugins:[...], count:N, changes_require_restart:true}`. Entries
+include name/version/description, source/ref/revision/subdir/digest/installed_at,
+enabled/trusted/requires_trust, contribution names (`skills`, `commands`, `agents`,
+`mcp_servers`), `hook_count`, and optional `error`. Prompt contents, hook commands,
+MCP environment and credentials are omitted; source URL userinfo/query/fragment
+are redacted. A missing installation directory returns an empty inventory without
+creating directories. An unreadable installation index returns an error; individual
+damaged bundles stay visible with their error so they can be removed or updated.
+
+Mutation responses include `action`, `name`, optional `plugin`,
+`runtime_restart_required:true` and `message`. Install returns 201; other successful
+operations return 200. Missing plugins return 404; unsupported methods return 405;
+invalid requests return 400, oversized JSON 413 and unsupported media types 415;
+a busy manager or conflicting trust/digest returns 409.
+Storage failures return 500 and operation deadlines return 504. Install JSON is
+limited to 16 KiB, update JSON to 4 KiB; Git/copy operations have a 90 second deadline.
+
+Local paths refer to the server filesystem. `trust` defaults to false on every
+install/update, and an update retains a manually disabled state. Executable MCP
+and hook plugins installed without trust remain disabled. Pure prompt plugins can
+be enabled without execution trust. These endpoints never execute the installed
+plugin or reload the Agent; restart each running API/gateway instance to apply
+changes. No configuration keys were added.
 
 Validation from this module, using published module pins or a local workspace:
 
