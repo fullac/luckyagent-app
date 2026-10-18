@@ -30,7 +30,11 @@ func createTestAgent(t *testing.T) *agent.Agent {
 			return
 		}
 		var req struct {
-			Stream bool `json:"stream"`
+			Stream   bool `json:"stream"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if req.Stream {
@@ -40,6 +44,10 @@ func createTestAgent(t *testing.T) *agent.Agent {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if len(req.Messages) > 0 && strings.HasPrefix(req.Messages[0].Content, "Review a delegated result") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"index": 0, "finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": `{"accepted":true,"reason":"test execution transcript reviewed"}`}}}})
+			return
+		}
 		_, _ = fmt.Fprint(w, `{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
 	}))
 	t.Cleanup(upstream.Close)
@@ -77,6 +85,9 @@ func TestNew(t *testing.T) {
 	if s == nil {
 		t.Fatal("server should not be nil")
 	}
+	if s.delegateManager != a.CollabManager() || s.collabRegistry != a.AgentRegistry() {
+		t.Fatal("server replaced the configured collaboration runtime")
+	}
 	if s.config.Addr != "127.0.0.1:9090" {
 		t.Errorf("expected addr 127.0.0.1:9090, got %s", s.config.Addr)
 	}
@@ -96,7 +107,7 @@ func TestNew(t *testing.T) {
 	if err != nil {
 		t.Fatalf("delegate collab task: %v", err)
 	}
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		record, ok, err := a.TaskStore().Get(task.ID)
 		if err != nil {

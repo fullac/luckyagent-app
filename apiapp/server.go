@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -216,35 +215,10 @@ func New(a *agent.Agent, cfg ServerConfig) *Server {
 
 	// v0.22.0: 多 Agent 协作
 	collabRegistry := collab.NewRegistry()
-	delegateManager := collab.NewDelegateManager(collabRegistry, collab.TaskHandlerFunc(func(ctx context.Context, task *collab.SubTask) (string, error) {
-		// Keep one durable transcript per delegated sub-agent. The execution
-		// session IDs are assigned by DelegateManager before the goroutine starts,
-		// so the task detail page can open the same conversation while it runs.
-		if a == nil {
-			return "", fmt.Errorf("agent runtime is not initialized")
-		}
-		sessionID := strings.TrimSpace(task.ExecutionSessionID)
-		if sessionID == "" {
-			return a.Chat(ctx, task.Input)
-		}
-		if _, ok := a.Sessions().Get(sessionID); !ok {
-			a.Sessions().Ensure(sessionID)
-		}
-		if sess, ok := a.Sessions().Get(sessionID); ok {
-			role := "subagent"
-			if strings.TrimSpace(task.AgentID) != "" {
-				role += ":" + strings.TrimSpace(task.AgentID)
-			}
-			profile := "You are a delegated collaboration sub-agent in LuckyAgent. Follow the assigned role, keep evidence for your result, and report blockers or unfinished work clearly."
-			sess.SetAgentProfile(role, profile)
-		}
-		return a.ChatWithSession(ctx, sessionID, task.Input)
-	}))
-	if a != nil && a.TaskStore() != nil {
-		delegateManager.SetTaskStore(a.TaskStore())
-	}
-	if a != nil && a.Config() != nil {
-		_ = delegateManager.SetMDPSnapshotPath(filepath.Join(a.Config().HomeDir(), "planner", "mdp.json"))
+	delegateManager := collab.NewDelegateManager(collabRegistry, nil)
+	if a != nil && a.CollabManager() != nil && a.AgentRegistry() != nil {
+		// Reuse the configured executor and recovered task tree owned by Agent.
+		delegateManager, collabRegistry = a.CollabManager(), a.AgentRegistry()
 	}
 
 	// v0.24.0: Workflow Engine
