@@ -101,13 +101,13 @@ func TestSessionToolTraceFirstTurnDoesNotIncludeFollowups(t *testing.T) {
 		{Role: "system", Content: "profile"},
 		{Role: "user", Content: "assigned task"},
 		{Role: "assistant", ToolCalls: []provider.ToolCall{{ID: "assigned", Name: "file_read"}}},
-		{Role: "tool", ToolCallID: "assigned", Content: "result"},
+		{Role: "tool", ToolCallID: "assigned", Content: "result", DurationMS: 1250},
 		{Role: "assistant", Content: "done"},
 		{Role: "user", Content: "follow-up"},
 		{Role: "assistant", ToolCalls: []provider.ToolCall{{ID: "followup", Name: "terminal"}}},
 	}
 	records := sessionToolTraceRecords(firstSessionTurn(messages))
-	if len(records) != 1 || records[0].ID != "assigned" {
+	if len(records) != 1 || records[0].ID != "assigned" || records[0].DurationMS != 1250 {
 		t.Fatalf("first turn records = %#v", records)
 	}
 	if got := firstSessionTurn(messages[:1]); len(got) != 0 {

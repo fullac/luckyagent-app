@@ -23,6 +23,9 @@ runtime, tools and API modules. The pinned dependencies provide these options:
   reviews execution requests even when the first response only promises work.
   The context inspection bucket maps can now contain `project`; clients should
   accept this additive key. No HTTP route or session format changes are required.
+- Persisted tool messages may include `run_id`, `started_at`, `duration_ms` and
+  `status`. `GET` session tool trace uses `duration_ms` for the matched tool
+  result. Older transcripts omit the field, and those records stay at duration 0.
 
 `POST /api/v1/context/fit` retains its existing text DTO: `role`, `content`,
 `priority` and `category`. Native `tool_calls` and `tool_call_id` are outside

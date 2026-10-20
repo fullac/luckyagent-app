@@ -3,6 +3,7 @@ package server
 import (
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/yurika0211/luckyagent-runtime/provider"
@@ -184,15 +185,16 @@ func sessionToolTraceRecords(messages []provider.Message, templateSets ...map[st
 				}
 			}
 		}
+		duration := time.Duration(message.DurationMS) * time.Millisecond
 		if !found {
-			record := tool.NewTraceRecordWithTemplates(message.Name, "", message.Content, 0, templates)
+			record := tool.NewTraceRecordWithTemplates(message.Name, "", message.Content, duration, templates)
 			record.ID = message.ToolCallID
 			records = append(records, record)
 			continue
 		}
 
 		id := records[index].ID
-		records[index] = tool.NewTraceRecordWithTemplates(records[index].Name, records[index].Arguments, message.Content, 0, templates)
+		records[index] = tool.NewTraceRecordWithTemplates(records[index].Name, records[index].Arguments, message.Content, duration, templates)
 		records[index].ID = id
 	}
 	return records
