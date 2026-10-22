@@ -895,7 +895,7 @@ func (h *AgentHandler) streamChatRun(ctx context.Context, client *Client, data C
 				observations = append([]string{"Previous user-facing update: " + previous}, observations...)
 			}
 		}
-		summaryCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+		summaryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		summary, err := runtime.ProgressFeedbackWithPrompt(summaryCtx, data.Message, round, observations, progressSummaryPrompt)
 		cancel()
 		if err != nil {
