@@ -10,7 +10,7 @@ require (
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
-	github.com/yurika0211/lucky-agent/agent v0.0.0-20261023121703-c4f54e2bea18
+	github.com/yurika0211/lucky-agent/agent v0.3.0
 	github.com/yurika0211/luckyagent-plugins v0.1.0
 	github.com/yurika0211/luckyagent-runtime v0.3.0
 	golang.org/x/term v0.41.0
