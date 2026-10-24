@@ -358,6 +358,7 @@ func (s *Server) Start() error {
 		Artifact:             s.handleArtifact,
 		Commands:             s.handleCommands,
 		Cron:                 s.handleCron,
+		CronByID:             s.handleCronByID,
 		Tasks:                s.handleTasks,
 		TaskByID:             s.handleTaskByID,
 		AutonomyDashboard:    s.handleAutonomyDashboard,

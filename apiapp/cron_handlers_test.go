@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,8 +63,64 @@ func TestHandleCronListsJobs(t *testing.T) {
 	}
 
 	methodNotAllowed := httptest.NewRecorder()
-	s.handleCron(methodNotAllowed, httptest.NewRequest(http.MethodPost, "/api/v1/cron", nil))
+	s.handleCron(methodNotAllowed, httptest.NewRequest(http.MethodPut, "/api/v1/cron", nil))
 	if methodNotAllowed.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("method status: got %d", methodNotAllowed.Code)
+	}
+}
+
+func TestHandleCronCreatePauseDelete(t *testing.T) {
+	a := createTestAgent(t)
+	s := New(a, DefaultServerConfig())
+	body := `{"name":"晨报","description":"汇总","schedule":"每天9点","mode":"agent","command":"汇总昨日","metadata":{"session_id":"sess-1","platform":"android"},"delete_after_run":true}`
+	w := httptest.NewRecorder()
+	s.handleCron(w, httptest.NewRequest(http.MethodPost, "/api/v1/cron", strings.NewReader(body)))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", w.Code, w.Body.String())
+	}
+	var created struct {
+		ID             string `json:"id"`
+		Schedule       string `json:"schedule"`
+		Expression     string `json:"expression"`
+		Status         string `json:"status"`
+		DeleteAfterRun bool   `json:"delete_after_run"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Schedule != "每天09:00" || created.Expression != "0 9 * * *" || !created.DeleteAfterRun || created.ID == "" {
+		t.Fatalf("created=%+v", created)
+	}
+
+	w = httptest.NewRecorder()
+	s.handleCronByID(w, httptest.NewRequest(http.MethodPatch, "/api/v1/cron/"+created.ID, strings.NewReader(`{"action":"pause"}`)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("pause status=%d body=%s", w.Code, w.Body.String())
+	}
+	var paused struct {
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&paused); err != nil {
+		t.Fatal(err)
+	}
+	if paused.Status != "paused" {
+		t.Fatalf("pause status=%s", paused.Status)
+	}
+
+	w = httptest.NewRecorder()
+	s.handleCronByID(w, httptest.NewRequest(http.MethodDelete, "/api/v1/cron/"+created.ID, nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("delete status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	s.handleCron(w, httptest.NewRequest(http.MethodGet, "/api/v1/cron", nil))
+	var listed struct {
+		Count int `json:"count"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if listed.Count != 0 {
+		t.Fatalf("job remained: %s", w.Body.String())
 	}
 }
