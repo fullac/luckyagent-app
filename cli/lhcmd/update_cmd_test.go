@@ -3,6 +3,8 @@ package lhcmd
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -261,6 +263,26 @@ func writeTestTarGz(path string, files map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func TestVerifyAssetSHA256(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "asset.bin")
+	payload := []byte("lucky-agent-update")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	want := hex.EncodeToString(sum[:])
+	if err := verifyAssetSHA256(path, strings.ToUpper(want)); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyAssetSHA256(path, ""); err == nil {
+		t.Fatal("missing checksum was accepted")
+	}
+	if err := verifyAssetSHA256(path, strings.Repeat("0", 64)); err == nil {
+		t.Fatal("tampered checksum was accepted")
+	}
 }
 
 func TestUpdateCommandRegistered(t *testing.T) {

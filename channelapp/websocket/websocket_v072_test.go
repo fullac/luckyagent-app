@@ -41,19 +41,11 @@ func createTestAgentForWS(t *testing.T) *agent.Agent {
 func cleanupPendingSession(t *testing.T, h *AgentHandler, sessionID string) {
 	t.Helper()
 	h.CancelSession(sessionID)
-	if h.WaitSession(sessionID, 5*time.Second) {
-		return
+	// PendingCount drops as soon as cancel deletes the map entry. WaitSession
+	// follows the handler goroutine, which is what still holds TempDir files.
+	if !h.WaitSession(sessionID, 5*time.Second) {
+		t.Fatalf("pending websocket chat did not finish for session %s", sessionID)
 	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if h.PendingCount() == 0 {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	t.Logf("warning: pending websocket chat did not finish for session %s", sessionID)
 }
 
 type stubAgentRuntime struct {
