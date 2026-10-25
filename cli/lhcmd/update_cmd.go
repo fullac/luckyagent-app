@@ -5,6 +5,8 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,12 +46,14 @@ type updateManifest struct {
 type manifestAsset struct {
 	Name        string `json:"name"`
 	DownloadURL string `json:"download_url"`
+	SHA256      string `json:"sha256"`
 }
 
 type releaseTarget struct {
 	Tag         string
 	AssetName   string
 	DownloadURL string
+	SHA256      string
 }
 
 func newUpdateCmd() *cobra.Command {
@@ -160,6 +164,9 @@ func runUpdate(ctx context.Context, opts *updateOptions) error {
 	if err := downloadFile(ctx, target.DownloadURL, archivePath); err != nil {
 		return err
 	}
+	if err := verifyAssetSHA256(archivePath, target.SHA256); err != nil {
+		return err
+	}
 
 	extractDir := filepath.Join(tmpDir, "extract")
 	if err := os.MkdirAll(extractDir, 0o755); err != nil {
@@ -255,6 +262,7 @@ func fetchReleaseTarget(ctx context.Context, repo, version, assetName string) (*
 				Tag:         manifest.TagName,
 				AssetName:   asset.Name,
 				DownloadURL: asset.DownloadURL,
+				SHA256:      strings.ToLower(strings.TrimSpace(asset.SHA256)),
 			}, nil
 		}
 	}
@@ -304,6 +312,27 @@ func downloadFile(ctx context.Context, url, dest string) error {
 		return fmt.Errorf("write asset: %w", err)
 	}
 	return f.Close()
+}
+
+func verifyAssetSHA256(path, want string) error {
+	want = strings.ToLower(strings.TrimSpace(want))
+	if want == "" {
+		return errors.New("update manifest asset is missing sha256")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		return fmt.Errorf("hash asset: %w", err)
+	}
+	got := hex.EncodeToString(sum.Sum(nil))
+	if got != want {
+		return fmt.Errorf("asset checksum mismatch: got %s want %s", got, want)
+	}
+	return nil
 }
 
 func extractUpdateArchive(archivePath, destDir string) error {
