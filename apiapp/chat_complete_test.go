@@ -57,6 +57,66 @@ func TestChatCompleteReturnsTextWithoutTouchingSessionsOrTools(t *testing.T) {
 	}
 }
 
+func TestChatCompleteExpandSendsFixedInstructionAndDraft(t *testing.T) {
+	var sawTools bool
+	var body string
+	a := agentWithUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		body = string(raw)
+		if strings.Contains(body, `"tools"`) {
+			sawTools = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"扩写后的请求"}}]}`)
+	})
+	existing := a.Sessions().NewWithTitle("Android session")
+	before := sessionSnapshot(a.Sessions().ListInfo())
+
+	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
+	w := httptest.NewRecorder()
+	s.handleChatComplete(w, httptest.NewRequest(http.MethodPost, "/api/v1/chat/complete", strings.NewReader(`{"intent":"expand","message":"修一下启动"}`)))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp) != 1 || resp["response"] != "扩写后的请求" {
+		t.Fatalf("response=%s", w.Body.String())
+	}
+	if sawTools || !strings.Contains(body, "大约 100 字") || !strings.Contains(body, "修一下启动") {
+		t.Fatalf("tools=%v body=%s", sawTools, body)
+	}
+	if sessionSnapshot(a.Sessions().ListInfo()) != before {
+		t.Fatal("expand changed sessions")
+	}
+	got, ok := a.Sessions().Get(existing.ID)
+	if !ok || got.MessageCount() != 0 || got.Title != "Android session" {
+		t.Fatalf("named session changed: ok=%v", ok)
+	}
+}
+
+func TestChatCompleteRejectsUnknownIntentBeforeCallingTheModel(t *testing.T) {
+	var calls int
+	a := agentWithUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	})
+	s := New(a, DefaultServerConfig())
+	t.Cleanup(func() { _ = s.Stop() })
+	w := httptest.NewRecorder()
+	s.handleChatComplete(w, httptest.NewRequest(http.MethodPost, "/api/v1/chat/complete", strings.NewReader(`{"intent":"rewrite","message":"修一下启动"}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if calls != 0 {
+		t.Fatalf("upstream calls=%d", calls)
+	}
+}
+
 func TestChatCompleteRejectsEmptyMessageBeforeCallingTheModel(t *testing.T) {
 	var calls int
 	a := agentWithUpstream(t, func(w http.ResponseWriter, r *http.Request) {
