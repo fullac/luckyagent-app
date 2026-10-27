@@ -11,9 +11,24 @@ import (
 
 // completeRequest stays smaller than ChatRequest. A session id, attachment, or
 // iteration count would make this look like another chat turn.
+// Intent selects a fixed instruction. The client still supplies only the draft.
 type completeRequest struct {
 	Message string `json:"message"`
+	Intent  string `json:"intent,omitempty"`
 }
+
+const intentExpand = "expand"
+
+// expandInstruction is fixed by the server. A client-supplied prompt would let a
+// draft ask the model to ignore the expansion rules.
+const expandInstruction = `把下面的草稿扩写成一段可直接发送的请求。
+
+保留原意。补上缺的对象、范围、约束和完成标准。不要改成另一件事。
+不要加开场、解释或候选列表。只输出扩写后的正文。
+大约 100 字。草稿本身已经完整时，只补缺的部分，不要为了凑字数重复。
+
+草稿：
+`
 
 // handleChatComplete asks the current chat provider once.
 // Provider.Chat is the plain completion path: it sends no tool schema and does
@@ -28,12 +43,32 @@ func (s *Server) handleChatComplete(w http.ResponseWriter, r *http.Request) {
 		transport.SendRequestError(w, err)
 		return
 	}
-	text, err := s.completeOnce(r.Context(), req.Message)
+	message, err := completionMessage(req)
+	if err != nil {
+		s.sendError(w, "completion failed", completionStatus(err), err.Error())
+		return
+	}
+	text, err := s.completeOnce(r.Context(), message)
 	if err != nil {
 		s.sendError(w, "completion failed", completionStatus(err), err.Error())
 		return
 	}
 	s.sendJSON(w, http.StatusOK, map[string]string{"response": text})
+}
+
+func completionMessage(req completeRequest) (string, error) {
+	draft := strings.TrimSpace(req.Message)
+	if draft == "" {
+		return "", errCompletionMessageRequired
+	}
+	switch strings.TrimSpace(req.Intent) {
+	case "":
+		return draft, nil
+	case intentExpand:
+		return expandInstruction + draft, nil
+	default:
+		return "", errCompletionIntent
+	}
 }
 
 func (s *Server) completeOnce(ctx context.Context, message string) (string, error) {
@@ -63,6 +98,7 @@ func (e *completionError) Error() string { return e.message }
 
 var (
 	errCompletionMessageRequired = &completionError{"message is required", http.StatusBadRequest}
+	errCompletionIntent          = &completionError{"intent is not supported", http.StatusBadRequest}
 	errCompletionUnavailable     = &completionError{"agent runtime unavailable", http.StatusServiceUnavailable}
 	errCompletionEmpty           = &completionError{"model returned no text", http.StatusBadGateway}
 )
