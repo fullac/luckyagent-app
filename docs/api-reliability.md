@@ -7,6 +7,11 @@ launcher `docs/API.md` for product routes and the API module's
 
 ## HTTP chat
 
+`POST /api/v1/chat/complete` asks the current chat provider once and returns
+`{"response":"..."}`. It does not create a session, append messages, or send a
+tool schema. An empty message is 400. A provider error is 500. A tool call or
+blank completion is 502. This is not a chat turn and has no `session_id`.
+
 Both chat endpoints reject an explicit unknown session with 404 before invoking
 the Agent. Omitting a session ID creates a session, and a successful synchronous
 response belongs to that actual saved session. JSON is limited to 2 MiB and

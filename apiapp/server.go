@@ -352,6 +352,7 @@ func (s *Server) Start() error {
 		Approvals:            s.handleApprovals,
 		Chat:                 s.handleChat,
 		ChatSync:             s.handleChatSync,
+		ChatComplete:         s.handleChatComplete,
 		Sessions:             s.handleSessions,
 		SessionByID:          s.handleSessionByID,
 		Uploads:              s.handleUploads,
@@ -1761,6 +1762,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"endpoints": []string{
 			"POST /api/v1/chat       — 流式聊天 (SSE)",
 			"POST /api/v1/chat/sync  — 同步聊天",
+			"POST /api/v1/chat/complete — 当前模型单次生成，不写会话",
 			"GET|PUT|PATCH /api/v1/config — 读取或更新脱敏配置",
 			"GET /api/v1/config/schema — 配置字段元数据",
 			"POST /api/v1/config/reload — 从磁盘重载配置",
