@@ -132,8 +132,8 @@ github.com/yurika0211/aestus v0.1.0 h1:ot1UPyRTq/c5tVRuvreypZDyclh/nqa8MiR23LxXD
 github.com/yurika0211/aestus v0.1.0/go.mod h1:xG8WJ/alq0XpbVK6A+uRCHpsV8uO9E5eYuwuAlnYYTo=
 github.com/yurika0211/lucky-agent/agent v0.3.1 h1:lLgymmW4kowt9Lk7x3IcrjZFdIvvqPo0yXvpnA3dKzM=
 github.com/yurika0211/lucky-agent/agent v0.3.1/go.mod h1:zv+5HtKMHESDjlXuDpzkV/4w0H+vKFVU+nuiYd6BNOg=
-github.com/yurika0211/luckyagent-api v0.2.3 h1:FD2NBjCAdPpKt6klSUWu7/ncCGxMLWeaTQ1crerBxDo=
-github.com/yurika0211/luckyagent-api v0.2.3/go.mod h1:auKwSvWrCAzckvc1IMmTjjNsOkZpJP2BhUk51WkIMeY=
+github.com/yurika0211/luckyagent-api v0.2.4 h1:4kquU8JOYFZKW0BXQRq35FC0o8FnZD0mmk8LbRHwkO4=
+github.com/yurika0211/luckyagent-api v0.2.4/go.mod h1:auKwSvWrCAzckvc1IMmTjjNsOkZpJP2BhUk51WkIMeY=
 github.com/yurika0211/luckyagent-gateway v0.2.2 h1:vq4SyWUh9kk1v+uJmn+H5Nev6r/v5Lg1+G3bz3mgTRs=
 github.com/yurika0211/luckyagent-gateway v0.2.2/go.mod h1:zog8ZaOyWKfJmM6MN43G5+ftyvjjxpiY3VsrcDR3+tE=
 github.com/yurika0211/luckyagent-orchestrator v0.1.1 h1:NipscOmOyFeVe0OLD+of73kCnRjxeJWLJfou50naWzI=
